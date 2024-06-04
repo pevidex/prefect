@@ -95,8 +95,7 @@ def test_load_extra_entrypoints_unparsable_entrypoint(capsys):
     _, stderr = capsys.readouterr()
     assert (
         "Warning! Failed to load extra entrypoint 'foo$bar': "
-        "AttributeError: 'NoneType' object has no attribute 'group'"
-        in stderr
+        "AttributeError: 'NoneType' object has no attribute 'group'" in stderr
     )
 
 
@@ -154,8 +153,7 @@ def test_load_extra_entrypoints_callable_that_raises(capsys):
     _, stderr = capsys.readouterr()
     assert (
         "Warning! Failed to run callable entrypoint "
-        "'test_module_name:raises_value_error': ValueError: test"
-        in stderr
+        "'test_module_name:raises_value_error': ValueError: test" in stderr
     )
 
 
@@ -179,8 +177,7 @@ def test_load_extra_entrypoints_error_on_import(capsys):
     _, stderr = capsys.readouterr()
     assert (
         "Warning! Failed to load extra entrypoint 'raising_module_name': "
-        "RuntimeError: test"
-        in stderr
+        "RuntimeError: test" in stderr
     )
 
 
@@ -198,8 +195,7 @@ def test_load_extra_entrypoints_missing_module(capsys):
     _, stderr = capsys.readouterr()
     assert (
         "Warning! Failed to load extra entrypoint 'nonexistant_module': "
-        "ModuleNotFoundError"
-        in stderr
+        "ModuleNotFoundError" in stderr
     )
 
 
@@ -222,8 +218,7 @@ def test_load_extra_entrypoints_missing_submodule(capsys):
     _, stderr = capsys.readouterr()
     assert (
         "Warning! Failed to load extra entrypoint 'test_module_name.missing_module': "
-        "ModuleNotFoundError"
-        in stderr
+        "ModuleNotFoundError" in stderr
     )
 
 
@@ -243,12 +238,11 @@ def test_load_extra_entrypoints_missing_attribute(capsys):
     _, stderr = capsys.readouterr()
     assert (
         "Warning! Failed to load extra entrypoint 'test_module_name:missing_attr': "
-        "AttributeError"
-        in stderr
+        "AttributeError" in stderr
     )
 
 
-def test_plugins_load_on_prefect_package_init(monkeypatch):
+def test_plugin_load_on_prefect_package_init(monkeypatch):
     mock_load_prefect_collections = Mock()
     mock_load_extra_entrypoints = Mock()
 
@@ -261,5 +255,5 @@ def test_plugins_load_on_prefect_package_init(monkeypatch):
 
     importlib.reload(prefect)
 
-    mock_load_prefect_collections.assert_called_once()
+    mock_load_prefect_collections.assert_not_called()  # We no longer load collections on import due to high performance cost
     mock_load_extra_entrypoints.assert_called_once()

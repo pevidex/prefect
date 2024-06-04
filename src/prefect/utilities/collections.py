@@ -1,8 +1,10 @@
 """
 Utilities for extensions of and operations on Python collections.
 """
+
 import io
 import itertools
+import warnings
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator as IteratorABC
 from collections.abc import Sequence
@@ -101,7 +103,7 @@ def dict_to_flatdict(
 
 
 def flatdict_to_dict(
-    dct: Dict[Tuple[KT, ...], VT]
+    dct: Dict[Tuple[KT, ...], VT],
 ) -> Dict[KT, Union[VT, Dict[KT, VT]]]:
     """Converts a flattened dictionary back to a nested dictionary.
 
@@ -153,7 +155,7 @@ def ensure_iterable(obj: Union[T, Iterable[T]]) -> Iterable[T]:
     return [obj]
 
 
-def listrepr(objs: Iterable, sep=" ") -> str:
+def listrepr(objs: Iterable[Any], sep: str = " ") -> str:
     return sep.join(repr(obj) for obj in objs)
 
 
@@ -219,7 +221,7 @@ class StopVisiting(BaseException):
 
 def visit_collection(
     expr,
-    visit_fn: Callable[[Any], Any],
+    visit_fn: Union[Callable[[Any, dict], Any], Callable[[Any], Any]],
     return_data: bool = False,
     max_depth: int = -1,
     context: Optional[dict] = None,
@@ -232,7 +234,7 @@ def visit_collection(
     `visit_fn` can be used to alter the element if `return_data` is set.
 
     Note that when using `return_data` a copy of each collection is created to avoid
-    mutating the original object. This may have significant performance penalities and
+    mutating the original object. This may have significant performance penalties and
     should only be used if you intend to transform the collection.
 
     Supported types:
@@ -246,8 +248,10 @@ def visit_collection(
 
     Args:
         expr (Any): a Python object or expression
-        visit_fn (Callable[[Any], Awaitable[Any]]): an async function that
-            will be applied to every non-collection element of expr.
+        visit_fn (Callable[[Any, Optional[dict]], Awaitable[Any]]): a function that
+            will be applied to every non-collection element of expr. The function can
+            accept one or two arguments. If two arguments are accepted, the second
+            argument will be the context dictionary.
         return_data (bool): if `True`, a copy of `expr` containing data modified
             by `visit_fn` will be returned. This is slower than `return_data=False`
             (the default).
@@ -337,37 +341,26 @@ def visit_collection(
         result = typ(**items) if return_data else None
 
     elif isinstance(expr, pydantic.BaseModel):
-        # NOTE: This implementation *does not* traverse private attributes
-        # Pydantic does not expose extras in `__fields__` so we use `__fields_set__`
-        # as well to get all of the relevant attributes
-        # Check for presence of attrs even if they're in the field set due to pydantic#4916
-        model_fields = {
-            f for f in expr.__fields_set__.union(expr.__fields__) if hasattr(expr, f)
-        }
-        items = [visit_nested(getattr(expr, key)) for key in model_fields]
+        typ = cast(Type[pydantic.BaseModel], typ)
 
-        if return_data:
-            # Collect fields with aliases so reconstruction can use the correct field name
-            aliases = {
-                key: value.alias
-                for key, value in expr.__fields__.items()
-                if value.has_alias
+        # when extra=allow, fields not in model_fields may be in model_fields_set
+        model_fields = expr.model_fields_set.union(expr.model_fields.keys())
+
+        # We may encounter a deprecated field here, but this isn't the caller's fault
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=DeprecationWarning)
+
+            updated_data = {
+                field: visit_nested(getattr(expr, field)) for field in model_fields
             }
 
-            model_instance = typ(
-                **{
-                    aliases.get(key) or key: value
-                    for key, value in zip(model_fields, items)
-                }
+        if return_data:
+            # Use construct to avoid validation and handle immutability
+            model_instance = typ.model_construct(
+                _fields_set=expr.model_fields_set, **updated_data
             )
-
-            # Private attributes are not included in `__fields_set__` but we do not want
-            # to drop them from the model so we restore them after constructing a new
-            # model
-            for attr in expr.__private_attributes__:
-                # Use `object.__setattr__` to avoid errors on immutable models
-                object.__setattr__(model_instance, attr, getattr(expr, attr))
-
+            for private_attr in expr.__private_attributes__:
+                setattr(model_instance, private_attr, getattr(expr, private_attr))
             result = model_instance
         else:
             result = None
@@ -410,3 +403,49 @@ def distinct(
             continue
         seen.add(key(item))
         yield item
+
+
+def get_from_dict(dct: Dict, keys: Union[str, List[str]], default: Any = None) -> Any:
+    """
+    Fetch a value from a nested dictionary or list using a sequence of keys.
+
+    This function allows to fetch a value from a deeply nested structure
+    of dictionaries and lists using either a dot-separated string or a list
+    of keys. If a requested key does not exist, the function returns the
+    provided default value.
+
+    Args:
+        dct: The nested dictionary or list from which to fetch the value.
+        keys: The sequence of keys to use for access. Can be a
+            dot-separated string or a list of keys. List indices can be included
+            in the sequence as either integer keys or as string indices in square
+            brackets.
+        default: The default value to return if the requested key path does not
+            exist. Defaults to None.
+
+    Returns:
+        The fetched value if the key exists, or the default value if it does not.
+
+    Examples:
+    >>> get_from_dict({'a': {'b': {'c': [1, 2, 3, 4]}}}, 'a.b.c[1]')
+    2
+    >>> get_from_dict({'a': {'b': [0, {'c': [1, 2]}]}}, ['a', 'b', 1, 'c', 1])
+    2
+    >>> get_from_dict({'a': {'b': [0, {'c': [1, 2]}]}}, 'a.b.1.c.2', 'default')
+    'default'
+    """
+    if isinstance(keys, str):
+        keys = keys.replace("[", ".").replace("]", "").split(".")
+    try:
+        for key in keys:
+            try:
+                # Try to cast to int to handle list indices
+                key = int(key)
+            except ValueError:
+                # If it's not an int, use the key as-is
+                # for dict lookup
+                pass
+            dct = dct[key]
+        return dct
+    except (TypeError, KeyError, IndexError):
+        return default

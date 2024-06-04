@@ -6,6 +6,7 @@ import pytest
 from prefect._internal.compatibility.deprecated import (
     PrefectDeprecationWarning,
     deprecated_callable,
+    deprecated_class,
     deprecated_field,
     deprecated_parameter,
     generate_deprecation_message,
@@ -145,7 +146,7 @@ def test_deprecated_field():
     ):
         Foo(y=10)
 
-    assert Foo.__fields__["y"].field_info.extra.get("deprecated") is True
+    assert Foo.model_fields["y"].json_schema_extra["deprecated"] is True
 
 
 def test_deprecated_field_when():
@@ -167,3 +168,22 @@ def test_deprecated_field_when():
         ),
     ):
         Foo(x=10)
+
+    assert Foo.model_fields["x"].json_schema_extra["deprecated"] is True
+
+
+def test_deprecated_class():
+    @deprecated_class(start_date="Jan 2022", help="test help")
+    class MyClass:
+        def __init__(self):
+            pass
+
+    with pytest.warns(
+        PrefectDeprecationWarning,
+        match=(
+            "MyClass has been deprecated. It will not be available after Jul 2022."
+            " test help"
+        ),
+    ):
+        obj = MyClass()
+        assert isinstance(obj, MyClass)

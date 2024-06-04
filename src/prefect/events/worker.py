@@ -1,17 +1,51 @@
 from contextlib import asynccontextmanager
 from contextvars import Context, copy_context
-from typing import Any, Optional, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
+from uuid import UUID
 
 from typing_extensions import Self
 
-from prefect._internal.compatibility.experimental import experiment_enabled
 from prefect._internal.concurrency.services import QueueService
-from prefect.settings import PREFECT_API_KEY, PREFECT_API_URL, PREFECT_CLOUD_API_URL
+from prefect.settings import (
+    PREFECT_API_KEY,
+    PREFECT_API_URL,
+    PREFECT_CLOUD_API_URL,
+)
 from prefect.utilities.context import temporary_context
 
-from .clients import EventsClient, NullEventsClient, PrefectCloudEventsClient
+from .clients import (
+    EventsClient,
+    NullEventsClient,
+    PrefectCloudEventsClient,
+    PrefectEphemeralEventsClient,
+    PrefectEventsClient,
+)
 from .related import related_resources_from_run_context
-from .schemas import Event
+from .schemas.events import Event
+
+
+def should_emit_events() -> bool:
+    return (
+        emit_events_to_cloud()
+        or should_emit_events_to_running_server()
+        or should_emit_events_to_ephemeral_server()
+    )
+
+
+def emit_events_to_cloud() -> bool:
+    api_url = PREFECT_API_URL.value()
+    return isinstance(api_url, str) and api_url.startswith(
+        PREFECT_CLOUD_API_URL.value()
+    )
+
+
+def should_emit_events_to_running_server() -> bool:
+    api_url = PREFECT_API_URL.value()
+    return isinstance(api_url, str)
+
+
+def should_emit_events_to_ephemeral_server() -> bool:
+    return PREFECT_API_KEY.value() is None
 
 
 class EventsWorker(QueueService[Event]):
@@ -19,22 +53,24 @@ class EventsWorker(QueueService[Event]):
         self, client_type: Type[EventsClient], client_options: Tuple[Tuple[str, Any]]
     ):
         super().__init__(client_type, client_options)
-        self._client_type = client_type
-        self._client_options = client_options
+        self.client_type = client_type
+        self.client_options = client_options
         self._client: EventsClient
+        self._context_cache: Dict[UUID, Context] = {}
 
     @asynccontextmanager
     async def _lifespan(self):
-        self._client = self._client_type(**{k: v for k, v in self._client_options})
+        self._client = self.client_type(**{k: v for k, v in self.client_options})
 
         async with self._client:
             yield
 
-    def _prepare_item(self, event: Event) -> Tuple[Event, Context]:
-        return (event, copy_context())
+    def _prepare_item(self, event: Event) -> Event:
+        self._context_cache[event.id] = copy_context()
+        return event
 
-    async def _handle(self, event_and_context: Tuple[Event, Context]):
-        event, context = event_and_context
+    async def _handle(self, event: Event):
+        context = self._context_cache.pop(event.id)
         with temporary_context(context=context):
             await self.attach_related_resources_from_context(event)
 
@@ -45,23 +81,23 @@ class EventsWorker(QueueService[Event]):
         event.related += await related_resources_from_run_context(exclude=exclude)
 
     @classmethod
-    def instance(cls: Type[Self], client_type: Optional[EventsClient] = None) -> Self:
+    def instance(
+        cls: Type[Self], client_type: Optional[Type[EventsClient]] = None
+    ) -> Self:
         client_kwargs = {}
 
         # Select a client type for this worker based on settings
         if client_type is None:
-            api = PREFECT_API_URL.value()
-            if (
-                experiment_enabled("events_client")
-                and api
-                and api.startswith(PREFECT_CLOUD_API_URL.value())
-            ):
+            if emit_events_to_cloud():
                 client_type = PrefectCloudEventsClient
                 client_kwargs = {
                     "api_url": PREFECT_API_URL.value(),
                     "api_key": PREFECT_API_KEY.value(),
                 }
-
+            elif should_emit_events_to_running_server():
+                client_type = PrefectEventsClient
+            elif should_emit_events_to_ephemeral_server():
+                client_type = PrefectEphemeralEventsClient
             else:
                 client_type = NullEventsClient
 

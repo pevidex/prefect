@@ -5,17 +5,21 @@ These contexts should never be directly mutated by the user.
 
 For more user-accessible information about the current run, see [`prefect.runtime`](../runtime/flow_run).
 """
+
 import os
 import sys
 import warnings
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar, Token
+from functools import update_wrapper
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
     ContextManager,
     Dict,
+    Generator,
     List,
     Optional,
     Set,
@@ -25,23 +29,28 @@ from typing import (
     Union,
 )
 
+import anyio
+import anyio._backends._asyncio
 import anyio.abc
 import pendulum
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic_extra_types.pendulum_dt import DateTime
+from sniffio import AsyncLibraryNotFoundError
+from typing_extensions import Self
 
 import prefect.logging
 import prefect.logging.configuration
 import prefect.settings
-from prefect.client.orchestration import PrefectClient
+from prefect.client.orchestration import PrefectClient, SyncPrefectClient, get_client
 from prefect.client.schemas import FlowRun, TaskRun
 from prefect.events.worker import EventsWorker
 from prefect.exceptions import MissingContextError
 from prefect.futures import PrefectFuture
 from prefect.results import ResultFactory
-from prefect.server.utilities.schemas import DateTimeTZ
 from prefect.settings import PREFECT_HOME, Profile, Settings
 from prefect.states import State
-from prefect.task_runners import BaseTaskRunner
+from prefect.task_runners import TaskRunner
+from prefect.utilities.asyncutils import run_coro_as_sync
 from prefect.utilities.importtools import load_script_as_module
 
 T = TypeVar("T")
@@ -53,7 +62,71 @@ if TYPE_CHECKING:
 # Define the global settings context variable
 # This will be populated downstream but must be null here to facilitate loading the
 # default settings.
-GLOBAL_SETTINGS_CONTEXT = None
+GLOBAL_SETTINGS_CONTEXT = None  # type: ignore
+
+
+def serialize_context() -> Dict[str, Any]:
+    """
+    Serialize the current context for use in a remote execution environment.
+    """
+
+    flow_run_context = EngineContext.get()
+    task_run_context = TaskRunContext.get()
+    tags_context = TagsContext.get()
+    settings_context = SettingsContext.get()
+
+    return {
+        "flow_run_context": flow_run_context.serialize() if flow_run_context else {},
+        "task_run_context": task_run_context.serialize() if task_run_context else {},
+        "tags_context": tags_context.serialize() if tags_context else {},
+        "settings_context": settings_context.serialize() if settings_context else {},
+    }
+
+
+@contextmanager
+def hydrated_context(
+    serialized_context: Optional[Dict[str, Any]] = None,
+    client: Union[PrefectClient, SyncPrefectClient, None] = None,
+):
+    with ExitStack() as stack:
+        if serialized_context:
+            # Set up settings context
+            if settings_context := serialized_context.get("settings_context"):
+                stack.enter_context(SettingsContext(**settings_context))
+            # Set up parent flow run context
+            # TODO: This task group isn't necessary in the new engine. Remove the background tasks
+            # attribute from FlowRunContext.
+            client = client or get_client(sync_client=True)
+            if flow_run_context := serialized_context.get("flow_run_context"):
+                try:
+                    task_group = anyio.create_task_group()
+                except AsyncLibraryNotFoundError:
+                    task_group = anyio._backends._asyncio.TaskGroup()
+                flow = flow_run_context["flow"]
+                flow_run_context = FlowRunContext(
+                    **flow_run_context,
+                    client=client,
+                    background_tasks=task_group,
+                    result_factory=run_coro_as_sync(ResultFactory.from_flow(flow)),
+                    task_runner=flow.task_runner.duplicate(),
+                    detached=True,
+                )
+                stack.enter_context(flow_run_context)
+            # Set up parent task run context
+            if parent_task_run_context := serialized_context.get("task_run_context"):
+                parent_task = parent_task_run_context["task"]
+                task_run_context = TaskRunContext(
+                    **parent_task_run_context,
+                    client=client,
+                    result_factory=run_coro_as_sync(
+                        ResultFactory.from_autonomous_task(parent_task)
+                    ),
+                )
+                stack.enter_context(task_run_context)
+            # Set up tags context
+            if tags_context := serialized_context.get("tags_context"):
+                stack.enter_context(tags(*tags_context["current_tags"]))
+        yield
 
 
 class ContextModel(BaseModel):
@@ -64,12 +137,11 @@ class ContextModel(BaseModel):
 
     # The context variable for storing data must be defined by the child class
     __var__: ContextVar
-    _token: Token = PrivateAttr(None)
-
-    class Config:
-        allow_mutation = False
-        arbitrary_types_allowed = True
-        extra = "forbid"
+    _token: Optional[Token] = PrivateAttr(None)
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+    )
 
     def __enter__(self):
         if self._token is not None:
@@ -88,10 +160,13 @@ class ContextModel(BaseModel):
         self._token = None
 
     @classmethod
-    def get(cls: Type[T]) -> Optional[T]:
+    def get(cls: Type[Self]) -> Optional[Self]:
+        """Get the current context instance"""
         return cls.__var__.get(None)
 
-    def copy(self, **kwargs):
+    def model_copy(
+        self: Self, *, update: Optional[Dict[str, Any]] = None, deep: bool = False
+    ):
         """
         Duplicate the context model, optionally choosing which fields to include, exclude, or change.
 
@@ -105,10 +180,16 @@ class ContextModel(BaseModel):
         Returns:
             A new model instance.
         """
+        new = super().model_copy(update=update, deep=deep)
         # Remove the token on copy to avoid re-entrance errors
-        new = super().copy(**kwargs)
         new._token = None
         return new
+
+    def serialize(self) -> Dict[str, Any]:
+        """
+        Serialize the context model to a dictionary that can be pickled with cloudpickle.
+        """
+        return self.model_dump(exclude_unset=True)
 
 
 class PrefectObjectRegistry(ContextModel):
@@ -122,16 +203,16 @@ class PrefectObjectRegistry(ContextModel):
         capture_failures: If set, failures during __init__ will be silenced and tracked.
     """
 
-    start_time: DateTimeTZ = Field(default_factory=lambda: pendulum.now("UTC"))
+    start_time: DateTime = Field(default_factory=lambda: pendulum.now("UTC"))
 
     _instance_registry: Dict[Type[T], List[T]] = PrivateAttr(
         default_factory=lambda: defaultdict(list)
     )
 
     # Failures will be a tuple of (exception, instance, args, kwargs)
-    _instance_init_failures: Dict[Type[T], List[Tuple[Exception, T, Tuple, Dict]]] = (
-        PrivateAttr(default_factory=lambda: defaultdict(list))
-    )
+    _instance_init_failures: Dict[
+        Type[T], List[Tuple[Exception, T, Tuple, Dict]]
+    ] = PrivateAttr(default_factory=lambda: defaultdict(list))
 
     block_code_execution: bool = False
     capture_failures: bool = False
@@ -165,17 +246,17 @@ class PrefectObjectRegistry(ContextModel):
         )
 
     @classmethod
-    def register_instances(cls, type_: Type):
+    def register_instances(cls, type_: Type[T]) -> Type[T]:
         """
         Decorator for a class that adds registration to the `PrefectObjectRegistry`
         on initialization of instances.
         """
-        __init__ = type_.__init__
+        original_init = type_.__init__
 
-        def __register_init__(__self__, *args, **kwargs):
+        def __register_init__(__self__: T, *args: Any, **kwargs: Any) -> None:
             registry = cls.get()
             try:
-                __init__(__self__, *args, **kwargs)
+                original_init(__self__, *args, **kwargs)
             except Exception as exc:
                 if not registry or not registry.capture_failures:
                     raise
@@ -185,8 +266,71 @@ class PrefectObjectRegistry(ContextModel):
                 if registry:
                     registry.register_instance(__self__)
 
+        update_wrapper(__register_init__, original_init)
+
         type_.__init__ = __register_init__
         return type_
+
+
+class ClientContext(ContextModel):
+    """
+    A context for managing the Prefect client instances.
+
+    Clients were formerly tracked on the TaskRunContext and FlowRunContext, but
+    having two separate places and the addition of both sync and async clients
+    made it difficult to manage. This context is intended to be the single
+    source for clients.
+
+    The client creates both sync and async clients, which can either be read
+    directly from the context object OR loaded with get_client, inject_client,
+    or other Prefect utilities.
+
+    with ClientContext.get_or_create() as ctx:
+        c1 = get_client(sync_client=True)
+        c2 = get_client(sync_client=True)
+        assert c1 is c2
+        assert c1 is ctx.sync_client
+    """
+
+    __var__ = ContextVar("clients")
+    sync_client: SyncPrefectClient
+    async_client: PrefectClient
+    _httpx_settings: Optional[dict[str, Any]] = PrivateAttr(None)
+    _context_stack: int = PrivateAttr(0)
+
+    def __init__(self, httpx_settings: Optional[dict[str, Any]] = None):
+        super().__init__(
+            sync_client=get_client(sync_client=True, httpx_settings=httpx_settings),
+            async_client=get_client(sync_client=False, httpx_settings=httpx_settings),
+        )
+        self._httpx_settings = httpx_settings
+        self._context_stack = 0
+
+    def __enter__(self):
+        self._context_stack += 1
+        if self._context_stack == 1:
+            self.sync_client.__enter__()
+            run_coro_as_sync(self.async_client.__aenter__())
+            return super().__enter__()
+        else:
+            return self
+
+    def __exit__(self, *exc_info):
+        self._context_stack -= 1
+        if self._context_stack == 0:
+            self.sync_client.__exit__(*exc_info)
+            run_coro_as_sync(self.async_client.__aexit__(*exc_info))
+            return super().__exit__(*exc_info)
+
+    @classmethod
+    @contextmanager
+    def get_or_create(cls) -> Generator["ClientContext", None, None]:
+        ctx = ClientContext.get()
+        if ctx:
+            yield ctx
+        else:
+            with ClientContext() as ctx:
+                yield ctx
 
 
 class RunContext(ContextModel):
@@ -199,11 +343,18 @@ class RunContext(ContextModel):
         client: The Prefect client instance being used for API communication
     """
 
-    start_time: DateTimeTZ = Field(default_factory=lambda: pendulum.now("UTC"))
-    client: PrefectClient
+    start_time: DateTime = Field(default_factory=lambda: pendulum.now("UTC"))
+    input_keyset: Optional[Dict[str, Dict[str, str]]] = None
+    client: Union[PrefectClient, SyncPrefectClient]
+
+    def serialize(self):
+        return self.model_dump(
+            include={"start_time", "input_keyset"},
+            exclude_unset=True,
+        )
 
 
-class FlowRunContext(RunContext):
+class EngineContext(RunContext):
     """
     The context for a flow run. Data in this context is only available from within a
     flow run function.
@@ -220,11 +371,16 @@ class FlowRunContext(RunContext):
         timeout_scope: The cancellation scope for flow level timeouts
     """
 
-    flow: "Flow"
-    flow_run: FlowRun
-    task_runner: BaseTaskRunner
+    flow: Optional["Flow"] = None
+    flow_run: Optional[FlowRun] = None
+    autonomous_task_run: Optional[TaskRun] = None
+    task_runner: TaskRunner
     log_prints: bool = False
-    parameters: Dict[str, Any]
+    parameters: Optional[Dict[str, Any]] = None
+
+    # Flag signaling if the flow run context has been serialized and sent
+    # to remote infrastructure.
+    detached: bool = False
 
     # Result handling
     result_factory: ResultFactory
@@ -252,7 +408,23 @@ class FlowRunContext(RunContext):
     # Events worker to emit events to Prefect Cloud
     events: Optional[EventsWorker] = None
 
-    __var__ = ContextVar("flow_run")
+    __var__: ContextVar = ContextVar("flow_run")
+
+    def serialize(self):
+        return self.model_dump(
+            include={
+                "flow_run",
+                "flow",
+                "parameters",
+                "log_prints",
+                "start_time",
+                "input_keyset",
+            },
+            exclude_unset=True,
+        )
+
+
+FlowRunContext = EngineContext  # for backwards compatibility
 
 
 class TaskRunContext(RunContext):
@@ -274,6 +446,19 @@ class TaskRunContext(RunContext):
     result_factory: ResultFactory
 
     __var__ = ContextVar("task_run")
+
+    def serialize(self):
+        return self.model_dump(
+            include={
+                "task_run",
+                "task",
+                "parameters",
+                "log_prints",
+                "start_time",
+                "input_keyset",
+            },
+            exclude_unset=True,
+        )
 
 
 class TagsContext(ContextModel):
@@ -320,7 +505,8 @@ class SettingsContext(ContextModel):
         return_value = super().__enter__()
 
         try:
-            os.makedirs(self.settings.value_of(PREFECT_HOME), exist_ok=True)
+            prefect_home = Path(self.settings.value_of(PREFECT_HOME))
+            prefect_home.mkdir(mode=0o0700, exist_ok=True)
         except OSError:
             warnings.warn(
                 (
@@ -378,7 +564,7 @@ def get_settings_context() -> SettingsContext:
 
 
 @contextmanager
-def tags(*new_tags: str) -> Set[str]:
+def tags(*new_tags: str) -> Generator[Set[str], None, None]:
     """
     Context manager to add tags to flow and task run calls.
 
@@ -405,7 +591,7 @@ def tags(*new_tags: str) -> Set[str]:
         >>> @flow
         >>> def my_flow():
         >>>     pass
-        >>> with tags("a", b"):
+        >>> with tags("a", "b"):
         >>>     my_flow()  # has tags: a, b
 
         Run a task with nested tag contexts
@@ -551,7 +737,7 @@ def root_settings_context():
 
 
 GLOBAL_SETTINGS_CONTEXT: SettingsContext = root_settings_context()
-GLOBAL_OBJECT_REGISTRY: ContextManager[PrefectObjectRegistry] = None
+GLOBAL_OBJECT_REGISTRY: Optional[ContextManager[PrefectObjectRegistry]] = None
 
 
 def initialize_object_registry():

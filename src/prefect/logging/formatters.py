@@ -48,12 +48,14 @@ class JsonFormatter(logging.Formatter):
 
         self.serializer = JSONSerializer(
             jsonlib="orjson",
-            object_encoder="pydantic.json.pydantic_encoder",
             dumps_kwargs={"option": orjson.OPT_INDENT_2} if fmt == "pretty" else {},
         )
 
     def format(self, record: logging.LogRecord) -> str:
         record_dict = record.__dict__.copy()
+
+        # GCP severity detection compatibility
+        record_dict.setdefault("severity", record.levelname)
 
         # replace any exception tuples returned by `sys.exc_info()`
         # with a JSON-serializable `dict`.
@@ -77,7 +79,7 @@ class PrefectFormatter(logging.Formatter):
         *,
         defaults=None,
         task_run_fmt: str = None,
-        flow_run_fmt: str = None
+        flow_run_fmt: str = None,
     ) -> None:
         """
         Implementation of the standard Python formatter with support for multiple
@@ -95,11 +97,7 @@ class PrefectFormatter(logging.Formatter):
             init_kwargs["defaults"] = defaults
             style_kwargs["defaults"] = defaults
 
-        # validate added in 3.8
-        if sys.version_info >= (3, 8):
-            init_kwargs["validate"] = validate
-        else:
-            validate = False
+        init_kwargs["validate"] = validate
 
         super().__init__(format, datefmt, style, **init_kwargs)
 

@@ -1,22 +1,6 @@
-import os
-import sys
 import threading
 import time
 from concurrent.futures import Future
-
-from packaging.version import Version
-
-import prefect
-
-# The version pauses were added in
-PAUSE_VERSION = Version("2.7.0")
-SERVER_VERSION = os.getenv("TEST_SERVER_VERSION")
-
-if Version(prefect.__version__) < PAUSE_VERSION or (
-    SERVER_VERSION and Version(SERVER_VERSION) < PAUSE_VERSION
-):
-    sys.exit(0)
-
 
 from prefect import flow, pause_flow_run, resume_flow_run, task
 from prefect.context import get_run_context

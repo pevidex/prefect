@@ -1,5 +1,4 @@
 import base64
-import re
 from pathlib import Path
 from typing import Dict
 
@@ -9,6 +8,7 @@ import yaml
 from kubernetes.client import ApiClient
 from kubernetes.config.kube_config import list_kube_config_contexts
 
+from prefect._internal.compatibility.deprecated import PrefectDeprecationWarning
 from prefect.blocks.kubernetes import KubernetesClusterConfig
 
 sample_base64_string = base64.b64encode(b"hello marvin from the other side")
@@ -43,6 +43,11 @@ def config_file(tmp_path) -> Path:
     config_file.write_text(CONFIG_CONTENT)
 
     return config_file
+
+
+async def test_raises_deprecation_warning():
+    with pytest.warns(PrefectDeprecationWarning):
+        KubernetesClusterConfig(config=CONFIG_CONTENT, context_name="docker-desktop")
 
 
 async def test_instantiation_from_file(config_file):
@@ -83,13 +88,7 @@ async def test_instantiation_from_str():
 
 
 async def test_instantiation_from_invalid_str():
-    with pytest.raises(
-        pydantic.ValidationError,
-        match=re.escape(
-            "1 validation error for KubernetesClusterConfig\nconfig\n  value is not a"
-            " valid dict (type=type_error.dict)"
-        ),
-    ):
+    with pytest.raises(pydantic.ValidationError, match=r"type=dict_type"):
         KubernetesClusterConfig(config="foo", context_name="docker-desktop")
 
 

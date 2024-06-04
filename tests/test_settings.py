@@ -17,7 +17,6 @@ from prefect.settings import (
     PREFECT_CLIENT_RETRY_EXTRA_CODES,
     PREFECT_CLOUD_API_URL,
     PREFECT_CLOUD_UI_URL,
-    PREFECT_CLOUD_URL,
     PREFECT_DEBUG_MODE,
     PREFECT_HOME,
     PREFECT_LOGGING_EXTRA_LOGGERS,
@@ -30,6 +29,7 @@ from prefect.settings import (
     PREFECT_TEST_SETTING,
     PREFECT_UI_API_URL,
     PREFECT_UI_URL,
+    REMOVED_EXPERIMENTAL_FLAGS,
     SETTING_VARIABLES,
     Profile,
     ProfilesCollection,
@@ -127,13 +127,13 @@ class TestSettingClass:
 class TestSettingsClass:
     def test_settings_copy_with_update_does_not_mark_unset_as_set(self):
         settings = get_current_settings()
-        set_keys = set(settings.dict(exclude_unset=True).keys())
+        set_keys = set(settings.model_dump(exclude_unset=True).keys())
         new_settings = settings.copy_with_update()
-        new_set_keys = set(new_settings.dict(exclude_unset=True).keys())
+        new_set_keys = set(new_settings.model_dump(exclude_unset=True).keys())
         assert new_set_keys == set_keys
 
         new_settings = settings.copy_with_update(updates={PREFECT_API_KEY: "TEST"})
-        new_set_keys = set(new_settings.dict(exclude_unset=True).keys())
+        new_set_keys = set(new_settings.model_dump(exclude_unset=True).keys())
         # Only the API key setting should be set
         assert new_set_keys - set_keys == {"PREFECT_API_KEY"}
 
@@ -174,15 +174,6 @@ class TestSettingsClass:
             ]
             == "3000"
         )
-
-    def test_settings_to_environment_respects_includes(self):
-        include = [PREFECT_SERVER_API_PORT]
-
-        assert Settings(PREFECT_SERVER_API_PORT=3000).to_environment_variables(
-            include=include
-        ) == {"PREFECT_SERVER_API_PORT": "3000"}
-
-        assert include == [PREFECT_SERVER_API_PORT], "Passed list should not be mutated"
 
     def test_settings_to_environment_respects_includes(self):
         include = [PREFECT_SERVER_API_PORT]
@@ -238,13 +229,21 @@ class TestSettingsClass:
         for key, value in variables.items():
             monkeypatch.setenv(key, value)
         new_settings = Settings()
-        assert settings.dict() == new_settings.dict()
+        assert settings.model_dump() == new_settings.model_dump()
 
     def test_settings_to_environment_does_not_use_value_callback(self):
         settings = Settings(PREFECT_UI_API_URL=None)
         # This would be cast to a non-null value if the value callback was used when
         # generating the environment variables
         assert "PREFECT_UI_API_URL" not in settings.to_environment_variables()
+
+    def test_settings_hash_key(self):
+        settings = Settings(PREFECT_TEST_MODE=True)
+        diff_settings = Settings(PREFECT_TEST_MODE=False)
+
+        assert settings.hash_key() == settings.hash_key()
+
+        assert settings.hash_key() != diff_settings.hash_key()
 
     @pytest.mark.parametrize(
         "log_level_setting",
@@ -283,7 +282,7 @@ class TestSettingsClass:
 
     def test_with_obfuscated_secrets(self):
         settings = get_current_settings()
-        original = settings.copy()
+        original = settings.model_copy()
         obfuscated = settings.with_obfuscated_secrets()
         assert settings == original
         assert original != obfuscated
@@ -343,18 +342,8 @@ class TestSettingAccess:
             else:
                 assert False, "Not treated as truth"
 
-    def test_ui_api_url_from_api_url(self):
-        with temporary_settings({PREFECT_API_URL: "http://test/api"}):
-            assert PREFECT_UI_API_URL.value() == "http://test/api"
-
-    def test_ui_api_url_from_orion_host_and_port(self):
-        with temporary_settings(
-            {PREFECT_SERVER_API_HOST: "test", PREFECT_SERVER_API_PORT: "1111"}
-        ):
-            assert PREFECT_UI_API_URL.value() == "http://test:1111/api"
-
     def test_ui_api_url_from_defaults(self):
-        assert PREFECT_UI_API_URL.value() == "http://127.0.0.1:4200/api"
+        assert PREFECT_UI_API_URL.value() == "/api"
 
     def test_database_connection_url_templates_password(self):
         with temporary_settings(
@@ -412,28 +401,6 @@ class TestSettingAccess:
     def test_prefect_home_expands_tilde_in_path(self):
         settings = Settings(PREFECT_HOME="~/test")
         assert PREFECT_HOME.value_from(settings) == Path("~/test").expanduser()
-
-    def test_prefect_cloud_url_deprecated_on_set(self):
-        with temporary_settings({PREFECT_CLOUD_URL: "test"}):
-            with pytest.raises(
-                DeprecationWarning,
-                match=(
-                    "`PREFECT_CLOUD_URL` is set and will be used instead of"
-                    " `PREFECT_CLOUD_API_URL`"
-                ),
-            ):
-                PREFECT_CLOUD_API_URL.value()
-
-    def test_prefect_cloud_url_deprecated_on_access(self):
-        with pytest.raises(
-            DeprecationWarning,
-            match=(
-                "Setting 'PREFECT_CLOUD_URL' has been deprecated. "
-                "It will not be available after Jun 2023. "
-                "Use `PREFECT_CLOUD_API_URL` instead."
-            ),
-        ):
-            PREFECT_CLOUD_URL.value()
 
     @pytest.mark.parametrize(
         "api_url,ui_url",
@@ -518,10 +485,10 @@ class TestTemporarySettings:
 
     def test_temporary_settings_does_not_mark_unset_as_set(self):
         settings = get_current_settings()
-        set_keys = set(settings.dict(exclude_unset=True).keys())
+        set_keys = set(settings.model_dump(exclude_unset=True).keys())
         with temporary_settings() as new_settings:
             pass
-        new_set_keys = set(new_settings.dict(exclude_unset=True).keys())
+        new_set_keys = set(new_settings.model_dump(exclude_unset=True).keys())
         assert new_set_keys == set_keys
 
     def test_temporary_settings_can_restore_to_defaults_values(self):
@@ -647,7 +614,7 @@ class TestLoadProfiles:
                 """
             )
         )
-        with pytest.raises(ValueError, match="Unknown setting.*'nested'"):
+        with pytest.raises(UserWarning, match="Setting 'nested' is not recognized "):
             load_profile("foo")
 
     def test_load_profile_with_invalid_key(self, temporary_profiles_path):
@@ -659,7 +626,29 @@ class TestLoadProfiles:
                 """
             )
         )
-        with pytest.raises(ValueError, match="Unknown setting.*'test'"):
+        with pytest.warns(UserWarning, match="Setting 'test' is not recognized"):
+            load_profile("foo")
+
+    @pytest.mark.parametrize("removed_flag", sorted(REMOVED_EXPERIMENTAL_FLAGS))
+    def test_removed_experimental_flags(self, temporary_profiles_path, removed_flag):
+        assert removed_flag in REMOVED_EXPERIMENTAL_FLAGS
+
+        temporary_profiles_path.write_text(
+            textwrap.dedent(
+                f"""
+                [profiles.foo]
+                {removed_flag} = "False"
+                """
+            )
+        )
+
+        with pytest.warns(
+            UserWarning,
+            match=(
+                f"Experimental flag '{removed_flag}' "
+                "has been removed, please update your 'foo' profile."
+            ),
+        ):
             load_profile("foo")
 
 
@@ -736,14 +725,14 @@ class TestProfilesCollection:
         profile = Profile(name="test", settings={})
         profiles = ProfilesCollection(profiles=[profile])
         assert profiles.profiles_by_name == {"test": profile}
-        assert profiles.active_name == None
+        assert profiles.active_name is None
 
     def test_init_stores_multiple_profile(self):
         foo = Profile(name="foo", settings={})
         bar = Profile(name="bar", settings={})
         profiles = ProfilesCollection(profiles=[foo, bar])
         assert profiles.profiles_by_name == {"foo": foo, "bar": bar}
-        assert profiles.active_name == None
+        assert profiles.active_name is None
 
     def test_init_sets_active_name(self):
         foo = Profile(name="foo", settings={})
@@ -851,7 +840,7 @@ class TestProfilesCollection:
 
     def test_remove_profile_does_not_exist(self):
         foo = Profile(name="foo", settings={})
-        bar = Profile(name="bar", settings={})
+        Profile(name="bar", settings={})
         profiles = ProfilesCollection(profiles=[foo], active=None)
         assert "bar" not in profiles.names
         with pytest.raises(KeyError):

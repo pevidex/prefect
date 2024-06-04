@@ -25,28 +25,11 @@ def get_running_loop() -> Optional[asyncio.BaseEventLoop]:
         return None
 
 
-def call_in_loop(
-    __loop: asyncio.AbstractEventLoop,
-    __fn: Callable[P, T],
-    *args: P.args,
-    **kwargs: P.kwargs
-) -> T:
-    """
-    Run a synchronous call in event loop's thread from another thread.
-
-    This function is blocking and not safe to call from an asynchronous context.
-
-    Returns the result of the call.
-    """
-    future = call_soon_in_loop(__loop, __fn, *args, **kwargs)
-    return future.result()
-
-
 def call_soon_in_loop(
     __loop: asyncio.AbstractEventLoop,
     __fn: Callable[P, T],
     *args: P.args,
-    **kwargs: P.kwargs
+    **kwargs: P.kwargs,
 ) -> concurrent.futures.Future:
     """
     Run a synchronous call in an event loop's thread from another thread.

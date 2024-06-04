@@ -1,14 +1,20 @@
 from typing import Any
 
-import pendulum
 from pydantic import Field, SecretStr
+from pydantic_extra_types.pendulum_dt import DateTime
 
+from prefect._internal.compatibility.deprecated import deprecated_class
 from prefect.blocks.core import Block
 
 
+@deprecated_class(
+    start_date="Jun 2024",
+    end_date="Jun 2025",
+    help="Use Variables to store json data instead.",
+)
 class JSON(Block):
     """
-    A block that represents JSON
+    A block that represents JSON. Deprecated, please use Variables to store JSON data instead.
 
     Attributes:
         value: A JSON-compatible value.
@@ -22,15 +28,20 @@ class JSON(Block):
         ```
     """
 
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/19W3Di10hhb4oma2Qer0x6/764d1e7b4b9974cd268c775a488b9d26/image16.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/4fcef2294b6eeb423b1332d1ece5156bf296ff96-48x48.png"
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/system/#prefect.blocks.system.JSON"
 
     value: Any = Field(default=..., description="A JSON-compatible value.")
 
 
+@deprecated_class(
+    start_date="Jun 2024",
+    end_date="Jun 2025",
+    help="Use Variables to store string data instead.",
+)
 class String(Block):
     """
-    A block that represents a string
+    A block that represents a string. Deprecated, please use Variables to store string data instead.
 
     Attributes:
         value: A string value.
@@ -44,15 +55,20 @@ class String(Block):
         ```
     """
 
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/4zjrZmh9tBrFiikeB44G4O/2ce1dbbac1c8e356f7c429e0f8bbb58d/image10.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/c262ea2c80a2c043564e8763f3370c3db5a6b3e6-48x48.png"
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/system/#prefect.blocks.system.String"
 
     value: str = Field(default=..., description="A string value.")
 
 
+@deprecated_class(
+    start_date="Jun 2024",
+    end_date="Jun 2025",
+    help="Use Variables to store datetime data instead.",
+)
 class DateTime(Block):
     """
-    A block that represents a datetime
+    A block that represents a datetime. Deprecated, please use Variables to store datetime data instead.
 
     Attributes:
         value: An ISO 8601-compatible datetime value.
@@ -67,10 +83,10 @@ class DateTime(Block):
     """
 
     _block_type_name = "Date Time"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/1gmljt5UBcAwEXHPnIofcE/0f3cf1da45b8b2df846e142ab52b1778/image21.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/8b3da9a6621e92108b8e6a75b82e15374e170ff7-48x48.png"
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/system/#prefect.blocks.system.DateTime"
 
-    value: pendulum.DateTime = Field(
+    value: DateTime = Field(
         default=...,
         description="An ISO 8601-compatible datetime value.",
     )
@@ -95,7 +111,7 @@ class Secret(Block):
         ```
     """
 
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/5uUmyGBjRejYuGTWbTxz6E/3003e1829293718b3a5d2e909643a331/image8.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/c6f20e556dd16effda9df16551feecfb5822092b-48x48.png"
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/system/#prefect.blocks.system.Secret"
 
     value: SecretStr = Field(

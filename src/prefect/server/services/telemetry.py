@@ -50,7 +50,7 @@ class Telemetry(LoopService):
             if telemetry_session is None:
                 self.logger.debug("No telemetry session found, setting")
                 session_id = str(uuid4())
-                session_start_timestamp = pendulum.now().to_iso8601_string()
+                session_start_timestamp = pendulum.now("UTC").to_iso8601_string()
 
                 telemetry_session = Configuration(
                     key="TELEMETRY_SESSION",
@@ -79,7 +79,7 @@ class Telemetry(LoopService):
         """
         Sends a heartbeat to the sens-o-matic
         """
-        from prefect.server.api.server import SERVER_API_VERSION
+        from prefect.client.constants import SERVER_API_VERSION
 
         if not hasattr(self, "session_id"):
             await self._fetch_or_set_telemetry_session()

@@ -4,7 +4,7 @@ import traceback
 import warnings
 from collections import Counter
 from types import GeneratorType, TracebackType
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Type, TypeVar
+from typing import Any, Dict, Iterable, Optional, Type
 
 import anyio
 import httpx
@@ -12,30 +12,21 @@ import pendulum
 from typing_extensions import TypeGuard
 
 from prefect.client.schemas import State as State
-from prefect.deprecated.data_documents import (
-    DataDocument,
-    result_from_state_with_data_document,
-)
+from prefect.client.schemas import StateDetails, StateType
 from prefect.exceptions import (
     CancelledRun,
     CrashedRun,
     FailedRun,
     MissingResult,
     PausedRun,
+    TerminationSignal,
+    UnfinishedRun,
 )
 from prefect.results import BaseResult, R, ResultFactory
-from prefect.server import schemas
-from prefect.server.schemas.states import StateDetails, StateType
 from prefect.settings import PREFECT_ASYNC_FETCH_STATE_RESULT
 from prefect.utilities.annotations import BaseAnnotation
 from prefect.utilities.asyncutils import in_async_main_thread, sync_compatible
 from prefect.utilities.collections import ensure_iterable
-
-if TYPE_CHECKING:
-    from prefect.deprecated.data_documents import DataDocument
-    from prefect.results import BaseResult
-
-R = TypeVar("R")
 
 
 def get_state_result(
@@ -52,7 +43,6 @@ def get_state_result(
     ):
         # Fetch defaults to `True` for sync users or async users who have opted in
         fetch = True
-
     if not fetch:
         if fetch is None and in_async_main_thread():
             warnings.warn(
@@ -65,13 +55,8 @@ def get_state_result(
                 DeprecationWarning,
                 stacklevel=2,
             )
-        # Backwards compatibility
-        if isinstance(state.data, DataDocument):
-            return result_from_state_with_data_document(
-                state, raise_on_failure=raise_on_failure
-            )
-        else:
-            return state.data
+
+        return state.data
     else:
         return _get_state_result(state, raise_on_failure=raise_on_failure)
 
@@ -83,18 +68,19 @@ async def _get_state_result(state: State[R], raise_on_failure: bool) -> R:
     """
     if state.is_paused():
         # Paused states are not truly terminal and do not have results associated with them
-        raise PausedRun("Run paused.")
+        raise PausedRun("Run is paused, its result is not available.", state=state)
+
+    if not state.is_final():
+        raise UnfinishedRun(
+            f"Run is in {state.type.name} state, its result is not available."
+        )
 
     if raise_on_failure and (
         state.is_crashed() or state.is_failed() or state.is_cancelled()
     ):
         raise await get_state_exception(state)
 
-    if isinstance(state.data, DataDocument):
-        result = result_from_state_with_data_document(
-            state, raise_on_failure=raise_on_failure
-        )
-    elif isinstance(state.data, BaseResult):
+    if isinstance(state.data, BaseResult):
         result = await state.data.get()
     elif state.data is None:
         if state.is_failed() or state.is_crashed() or state.is_cancelled():
@@ -115,7 +101,10 @@ async def _get_state_result(state: State[R], raise_on_failure: bool) -> R:
 
 def format_exception(exc: BaseException, tb: TracebackType = None) -> str:
     exc_type = type(exc)
-    formatted = "".join(list(traceback.format_exception(exc_type, exc, tb=tb)))
+    if tb is not None:
+        formatted = "".join(list(traceback.format_exception(exc_type, exc, tb=tb)))
+    else:
+        formatted = f"{exc_type.__name__}: {exc}"
 
     # Trim `prefect` module paths from our exception types
     if exc_type.__module__.startswith("prefect."):
@@ -141,6 +130,9 @@ async def exception_to_crashed_state(
 
     elif isinstance(exc, KeyboardInterrupt):
         state_message = "Execution was aborted by an interrupt signal."
+
+    elif isinstance(exc, TerminationSignal):
+        state_message = "Execution was aborted by a termination signal."
 
     elif isinstance(exc, SystemExit):
         state_message = "Execution was aborted by Python system exit call."
@@ -183,13 +175,13 @@ async def exception_to_failed_state(
     Convenience function for creating `Failed` states from exceptions
     """
     if not exc:
-        _, exc, exc_tb = sys.exc_info()
+        _, exc, _ = sys.exc_info()
         if exc is None:
             raise ValueError(
                 "Exception was not passed and no active exception could be found."
             )
     else:
-        exc_tb = exc.__traceback__
+        pass
 
     if result_factory:
         data = await result_factory.create_result(exc)
@@ -206,7 +198,10 @@ async def exception_to_failed_state(
     #       excluded from messages for now
     message = existing_message + format_exception(exc)
 
-    return Failed(data=data, message=message, **kwargs)
+    state = Failed(data=data, message=message, **kwargs)
+    state.state_details.retriable = False
+
+    return state
 
 
 async def return_value_to_state(retval: R, result_factory: ResultFactory) -> State[R]:
@@ -232,17 +227,12 @@ async def return_value_to_state(retval: R, result_factory: ResultFactory) -> Sta
     """
 
     if (
-        is_state(retval)
+        isinstance(retval, State)
         # Check for manual creation
         and not retval.state_details.flow_run_id
         and not retval.state_details.task_run_id
     ):
         state = retval
-
-        # Do not modify states with data documents attached; backwards compatibility
-        if isinstance(state.data, DataDocument):
-            return state
-
         # Unless the user has already constructed a result explicitly, use the factory
         # to update the data to the correct type
         if not isinstance(state.data, BaseResult):
@@ -251,7 +241,7 @@ async def return_value_to_state(retval: R, result_factory: ResultFactory) -> Sta
         return state
 
     # Determine a new state from the aggregate of contained states
-    if is_state(retval) or is_state_iterable(retval):
+    if isinstance(retval, State) or is_state_iterable(retval):
         states = StateGroup(ensure_iterable(retval))
 
         # Determine the new state type
@@ -259,6 +249,8 @@ async def return_value_to_state(retval: R, result_factory: ResultFactory) -> Sta
             new_state_type = StateType.COMPLETED
         elif states.any_cancelled():
             new_state_type = StateType.CANCELLED
+        elif states.any_paused():
+            new_state_type = StateType.PAUSED
         else:
             new_state_type = StateType.FAILED
 
@@ -267,6 +259,8 @@ async def return_value_to_state(retval: R, result_factory: ResultFactory) -> Sta
             message = "All states completed."
         elif states.any_cancelled():
             message = f"{states.cancelled_count}/{states.total_count} states cancelled."
+        elif states.any_paused():
+            message = f"{states.paused_count}/{states.total_count} states paused."
         elif states.any_failed():
             message = f"{states.fail_count}/{states.total_count} states failed."
         elif not states.all_final():
@@ -292,7 +286,10 @@ async def return_value_to_state(retval: R, result_factory: ResultFactory) -> Sta
         data = retval
 
     # Otherwise, they just gave data and this is a completed retval
-    return Completed(data=await result_factory.create_result(data))
+    if isinstance(data, BaseResult):
+        return Completed(data=data)
+    else:
+        return Completed(data=await result_factory.create_result(data))
 
 
 @sync_compatible
@@ -382,15 +379,6 @@ async def raise_state_exception(state: State) -> None:
     raise await get_state_exception(state)
 
 
-def is_state(obj: Any) -> TypeGuard[schemas.states.State]:
-    """
-    Check if the given object is a state instance
-    """
-    # We may want to narrow this to client-side state types but for now this provides
-    # backwards compatibility
-    return isinstance(obj, schemas.states.State)
-
-
 def is_state_iterable(obj: Any) -> TypeGuard[Iterable[State]]:
     """
     Check if a the given object is an iterable of states types
@@ -402,14 +390,14 @@ def is_state_iterable(obj: Any) -> TypeGuard[Iterable[State]]:
 
     Other iterables will return `False` even if they contain states.
     """
-    # We do not check for arbitary iterables because this is not intended to be used
+    # We do not check for arbitrary iterables because this is not intended to be used
     # for things like dictionaries, dataframes, or pydantic models
     if (
         not isinstance(obj, BaseAnnotation)
         and isinstance(obj, (list, set, tuple))
         and obj
     ):
-        return all([is_state(o) for o in obj])
+        return all([isinstance(o, State) for o in obj])
     else:
         return False
 
@@ -422,6 +410,7 @@ class StateGroup:
         self.cancelled_count = self.type_counts[StateType.CANCELLED]
         self.final_count = sum(state.is_final() for state in states)
         self.not_final_count = self.total_count - self.final_count
+        self.paused_count = self.type_counts[StateType.PAUSED]
 
     @property
     def fail_count(self):
@@ -438,6 +427,9 @@ class StateGroup:
             self.type_counts[StateType.FAILED] > 0
             or self.type_counts[StateType.CRASHED] > 0
         )
+
+    def any_paused(self) -> bool:
+        return self.paused_count > 0
 
     def all_final(self) -> bool:
         return self.final_count == self.total_count
@@ -464,93 +456,102 @@ class StateGroup:
 
 
 def Scheduled(
-    cls: Type[State] = State, scheduled_time: datetime.datetime = None, **kwargs
-) -> State:
+    cls: Type[State[R]] = State,
+    scheduled_time: Optional[datetime.datetime] = None,
+    **kwargs: Any,
+) -> State[R]:
     """Convenience function for creating `Scheduled` states.
 
     Returns:
         State: a Scheduled state
     """
-    return schemas.states.Scheduled(cls=cls, scheduled_time=scheduled_time, **kwargs)
+    state_details = StateDetails.model_validate(kwargs.pop("state_details", {}))
+    if scheduled_time is None:
+        scheduled_time = pendulum.now("UTC")
+    elif state_details.scheduled_time:
+        raise ValueError("An extra scheduled_time was provided in state_details")
+    state_details.scheduled_time = scheduled_time
+
+    return cls(type=StateType.SCHEDULED, state_details=state_details, **kwargs)
 
 
-def Completed(cls: Type[State] = State, **kwargs) -> State:
+def Completed(cls: Type[State[R]] = State, **kwargs: Any) -> State[R]:
     """Convenience function for creating `Completed` states.
 
     Returns:
         State: a Completed state
     """
-    return schemas.states.Completed(cls=cls, **kwargs)
+    return cls(type=StateType.COMPLETED, **kwargs)
 
 
-def Running(cls: Type[State] = State, **kwargs) -> State:
+def Running(cls: Type[State[R]] = State, **kwargs: Any) -> State[R]:
     """Convenience function for creating `Running` states.
 
     Returns:
         State: a Running state
     """
-    return schemas.states.Running(cls=cls, **kwargs)
+    return cls(type=StateType.RUNNING, **kwargs)
 
 
-def Failed(cls: Type[State] = State, **kwargs) -> State:
+def Failed(cls: Type[State[R]] = State, **kwargs: Any) -> State[R]:
     """Convenience function for creating `Failed` states.
 
     Returns:
         State: a Failed state
     """
-    return schemas.states.Failed(cls=cls, **kwargs)
+    return cls(type=StateType.FAILED, **kwargs)
 
 
-def Crashed(cls: Type[State] = State, **kwargs) -> State:
+def Crashed(cls: Type[State[R]] = State, **kwargs: Any) -> State[R]:
     """Convenience function for creating `Crashed` states.
 
     Returns:
         State: a Crashed state
     """
-    return schemas.states.Crashed(cls=cls, **kwargs)
+    return cls(type=StateType.CRASHED, **kwargs)
 
 
-def Cancelling(cls: Type[State] = State, **kwargs) -> State:
+def Cancelling(cls: Type[State[R]] = State, **kwargs: Any) -> State[R]:
     """Convenience function for creating `Cancelling` states.
 
     Returns:
         State: a Cancelling state
     """
-    return schemas.states.Cancelling(cls=cls, **kwargs)
+    return cls(type=StateType.CANCELLING, **kwargs)
 
 
-def Cancelled(cls: Type[State] = State, **kwargs) -> State:
+def Cancelled(cls: Type[State[R]] = State, **kwargs: Any) -> State[R]:
     """Convenience function for creating `Cancelled` states.
 
     Returns:
         State: a Cancelled state
     """
-    return schemas.states.Cancelled(cls=cls, **kwargs)
+    return cls(type=StateType.CANCELLED, **kwargs)
 
 
-def Pending(cls: Type[State] = State, **kwargs) -> State:
+def Pending(cls: Type[State[R]] = State, **kwargs: Any) -> State[R]:
     """Convenience function for creating `Pending` states.
 
     Returns:
         State: a Pending state
     """
-    return schemas.states.Pending(cls=cls, **kwargs)
+    return cls(type=StateType.PENDING, **kwargs)
 
 
 def Paused(
-    cls: Type[State] = State,
-    timeout_seconds: int = None,
-    pause_expiration_time: datetime.datetime = None,
+    cls: Type[State[R]] = State,
+    timeout_seconds: Optional[int] = None,
+    pause_expiration_time: Optional[datetime.datetime] = None,
     reschedule: bool = False,
-    pause_key: str = None,
-    **kwargs,
-) -> State:
+    pause_key: Optional[str] = None,
+    **kwargs: Any,
+) -> State[R]:
     """Convenience function for creating `Paused` states.
 
     Returns:
         State: a Paused state
     """
-    state_details = StateDetails.parse_obj(kwargs.pop("state_details", {}))
+    state_details = StateDetails.model_validate(kwargs.pop("state_details", {}))
 
     if state_details.pause_timeout:
         raise ValueError("An extra pause timeout was provided in state_details")
@@ -573,34 +574,61 @@ def Paused(
     return cls(type=StateType.PAUSED, state_details=state_details, **kwargs)
 
 
+def Suspended(
+    cls: Type[State[R]] = State,
+    timeout_seconds: Optional[int] = None,
+    pause_expiration_time: Optional[datetime.datetime] = None,
+    pause_key: Optional[str] = None,
+    **kwargs: Any,
+):
+    """Convenience function for creating `Suspended` states.
+
+    Returns:
+        State: a Suspended state
+    """
+    return Paused(
+        cls=cls,
+        name="Suspended",
+        reschedule=True,
+        timeout_seconds=timeout_seconds,
+        pause_expiration_time=pause_expiration_time,
+        pause_key=pause_key,
+        **kwargs,
+    )
+
+
 def AwaitingRetry(
-    cls: Type[State] = State, scheduled_time: datetime.datetime = None, **kwargs
-) -> State:
+    cls: Type[State[R]] = State,
+    scheduled_time: Optional[datetime.datetime] = None,
+    **kwargs: Any,
+) -> State[R]:
     """Convenience function for creating `AwaitingRetry` states.
 
     Returns:
         State: a AwaitingRetry state
     """
-    return schemas.states.AwaitingRetry(
-        cls=cls, scheduled_time=scheduled_time, **kwargs
+    return Scheduled(
+        cls=cls, scheduled_time=scheduled_time, name="AwaitingRetry", **kwargs
     )
 
 
-def Retrying(cls: Type[State] = State, **kwargs) -> State:
+def Retrying(cls: Type[State[R]] = State, **kwargs: Any) -> State[R]:
     """Convenience function for creating `Retrying` states.
 
     Returns:
         State: a Retrying state
     """
-    return schemas.states.Retrying(cls=cls, **kwargs)
+    return cls(type=StateType.RUNNING, name="Retrying", **kwargs)
 
 
 def Late(
-    cls: Type[State] = State, scheduled_time: datetime.datetime = None, **kwargs
-) -> State:
+    cls: Type[State[R]] = State,
+    scheduled_time: Optional[datetime.datetime] = None,
+    **kwargs: Any,
+) -> State[R]:
     """Convenience function for creating `Late` states.
 
     Returns:
         State: a Late state
     """
-    return schemas.states.Late(cls=cls, scheduled_time=scheduled_time, **kwargs)
+    return Scheduled(cls=cls, scheduled_time=scheduled_time, name="Late", **kwargs)

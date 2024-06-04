@@ -1,6 +1,7 @@
 """
 Routes for interacting with block capabilities.
 """
+
 from typing import List
 
 from fastapi import Depends

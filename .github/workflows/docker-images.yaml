@@ -1,7 +1,5 @@
 name: Docker images
 
-# Note: Conda support for 3.11 is pending. See https://github.com/ContinuumIO/anaconda-issues/issues/13082
-
 on:
   # On release events (also when a published release is converted from/to prerelease), push all patterns
   release:
@@ -9,6 +7,22 @@ on:
   # On each commit merged into main, push sha and branch patterns to prefect-dev
   push:
     branches: main
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "setup.py"
+      - "src/**"
+      - "tests/**"
+      - "requirements.txt"
+      - "requirements-client.txt"
+      - "MANIFEST.in"
+      - "setup.cfg"
+      - "versioneer.py"
+      - ".gitingore"
+      - ".gitattributes"
+      - ".github/workflows/docker-images.yaml"
+      - "ui/**"
+
   # On workflow_dispatch, push sha and branch patterns to prefect-dev
   workflow_dispatch:
 
@@ -24,37 +38,34 @@ jobs:
           - "-conda"
           - "-kubernetes"
         python-version:
-          - "3.7"
-          - "3.8"
           - "3.9"
           - "3.10"
           - "3.11"
-        exclude:
-          # Not yet supported, see note at top
-          - flavor: "-conda"
-            python-version: "3.11"
+          - "3.12"
 
     steps:
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:v0.12.5
 
       - name: Login to DockerHub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Generate tags for prefecthq/prefect-dev
         id: metadata-dev
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         # do not generate the development tags on release events
         if: ${{ github.event_name != 'release' }}
         with:
@@ -77,7 +88,7 @@ jobs:
 
       - name: Generate tags for prefecthq/prefect
         id: metadata-prod
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         # only generate the production tags on release events
         if: ${{ github.event_name == 'release' }}
         with:
@@ -88,14 +99,12 @@ jobs:
             type=pep440,pattern={{version}},suffix=-python${{ matrix.python-version }}${{ matrix.flavor }}
             type=pep440,pattern={{major}}.{{minor}},suffix=-python${{ matrix.python-version }}${{ matrix.flavor }},enable=${{ github.event.release.prerelease == false }}
             type=pep440,pattern={{major}},suffix=-python${{ matrix.python-version }}${{ matrix.flavor }},enable=${{ github.event.release.prerelease == false && github.ref_name == env.LATEST_TAG }}
-            type=raw,value=2-latest${{ matrix.flavor }},enable=${{ matrix.python-version == '3.10' && github.event.release.prerelease == false && github.ref_name == env.LATEST_TAG }}
+            type=raw,value=3-latest${{ matrix.flavor }},enable=${{ matrix.python-version == '3.10' && github.event.release.prerelease == false && github.ref_name == env.LATEST_TAG }}
           flavor: |
             latest=false
 
       - name: Build and push image
-        uses: docker/build-push-action@v4
-        env:
-          CACHE_TO_STRING: type=registry,ref=prefecthq/prefect-dev:buildcache-python${{ matrix.python-version }}${{ matrix.flavor }},mode=max
+        uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -108,6 +117,3 @@ jobs:
           push: true
           pull: true
           provenance: false
-          # multi-stage cache manifests (mode=max) need a separate tag because they are not usable for runtime ref https://github.com/moby/buildkit#export-cache
-          cache-from: type=registry,ref=prefecthq/prefect-dev:buildcache-python${{ matrix.python-version }}${{ matrix.flavor }}
-          cache-to: ${{ ( github.event_name == 'push' && env.CACHE_TO_STRING ) || '' }}

@@ -4,14 +4,23 @@ State schemas.
 
 import datetime
 import warnings
-from typing import Any, Generic, Optional, Type, TypeVar, Union
-from uuid import UUID
+from typing import TYPE_CHECKING, Any, Dict, Optional, Type, TypeVar, Union
+from uuid import UUID, uuid4
 
 import pendulum
-from pydantic import Field, root_validator, validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic_extra_types.pendulum_dt import DateTime
+from typing_extensions import Self
 
-from prefect.server.utilities.schemas import DateTimeTZ, IDBaseModel, PrefectBaseModel
+from prefect.server.utilities.schemas.bases import (
+    IDBaseModel,
+    PrefectBaseModel,
+)
 from prefect.utilities.collections import AutoEnum
+
+if TYPE_CHECKING:
+    from prefect.server.database.orm_models import ORMFlowRunState, ORMTaskRunState
+    from prefect.server.schemas.actions import StateCreate
 
 R = TypeVar("R")
 
@@ -30,6 +39,27 @@ class StateType(AutoEnum):
     CANCELLING = AutoEnum.auto()
 
 
+class CountByState(PrefectBaseModel):
+    COMPLETED: int = Field(default=0)
+    PENDING: int = Field(default=0)
+    RUNNING: int = Field(default=0)
+    FAILED: int = Field(default=0)
+    CANCELLED: int = Field(default=0)
+    CRASHED: int = Field(default=0)
+    PAUSED: int = Field(default=0)
+    CANCELLING: int = Field(default=0)
+    SCHEDULED: int = Field(default=0)
+
+    # TODO[pydantic]: We couldn't refactor the `validator`, please replace it by `field_validator` manually.
+    # Check https://docs.pydantic.dev/dev-v2/migration/#changes-to-validators for more information.
+    @field_validator("*")
+    @classmethod
+    def check_key(cls, value, info):
+        if info.name not in StateType.__members__:
+            raise ValueError(f"{info.name} is not a valid StateType")
+        return value
+
+
 TERMINAL_STATES = {
     StateType.COMPLETED,
     StateType.CANCELLED,
@@ -39,24 +69,27 @@ TERMINAL_STATES = {
 
 
 class StateDetails(PrefectBaseModel):
-    flow_run_id: UUID = None
-    task_run_id: UUID = None
+    flow_run_id: Optional[UUID] = None
+    task_run_id: Optional[UUID] = None
     # for task runs that represent subflows, the subflow's run ID
-    child_flow_run_id: UUID = None
-    scheduled_time: DateTimeTZ = None
-    cache_key: str = None
-    cache_expiration: DateTimeTZ = None
+    child_flow_run_id: Optional[UUID] = None
+    scheduled_time: Optional[DateTime] = None
+    cache_key: Optional[str] = None
+    cache_expiration: Optional[DateTime] = None
+    deferred: Optional[bool] = False
     untrackable_result: bool = False
-    pause_timeout: DateTimeTZ = None
+    pause_timeout: Optional[DateTime] = None
     pause_reschedule: bool = False
-    pause_key: str = None
-    refresh_cache: bool = None
+    pause_key: Optional[str] = None
+    run_input_keyset: Optional[Dict[str, str]] = None
+    refresh_cache: Optional[bool] = None
+    retriable: Optional[bool] = None
+    transition_id: Optional[UUID] = None
+    task_parameters_id: Optional[UUID] = None
 
 
 class StateBaseModel(IDBaseModel):
-    def orm_dict(
-        self, *args, shallow: bool = False, json_compatible: bool = False, **kwargs
-    ) -> dict:
+    def orm_dict(self, *args, **kwargs) -> dict:
         """
         This method is used as a convenience method for constructing fixtues by first
         building a `State` schema object and converting it into an ORM-compatible
@@ -65,24 +98,21 @@ class StateBaseModel(IDBaseModel):
         If state data is required, an artifact must be created separately.
         """
 
-        schema_dict = self.dict(
-            *args, shallow=shallow, json_compatible=json_compatible, **kwargs
-        )
+        schema_dict = self.model_dump(*args, **kwargs)
         # remove the data field in order to construct a state ORM model
         schema_dict.pop("data", None)
         return schema_dict
 
 
-class State(StateBaseModel, Generic[R]):
+class State(StateBaseModel):
     """Represents the state of a run."""
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
     type: StateType
     name: Optional[str] = Field(default=None)
-    timestamp: DateTimeTZ = Field(default_factory=lambda: pendulum.now("UTC"))
-    message: Optional[str] = Field(default=None, example="Run started")
+    timestamp: DateTime = Field(default_factory=lambda: pendulum.now("UTC"))
+    message: Optional[str] = Field(default=None, examples=["Run started"])
     data: Optional[Any] = Field(
         default=None,
         description=(
@@ -95,16 +125,13 @@ class State(StateBaseModel, Generic[R]):
     @classmethod
     def from_orm_without_result(
         cls,
-        orm_state: Union[
-            "prefect.server.database.orm_models.ORMFlowRunState",
-            "prefect.server.database.orm_models.ORMTaskRunState",
-        ],
+        orm_state: Union["ORMFlowRunState", "ORMTaskRunState"],
         with_data: Optional[Any] = None,
     ):
         """
         During orchestration, ORM states can be instantiated prior to inserting results
         into the artifact table and the `data` field will not be eagerly loaded. In
-        these cases, sqlalchemy will attept to lazily load the the relationship, which
+        these cases, sqlalchemy will attempt to lazily load the the relationship, which
         will fail when called within a synchronous pydantic method.
 
         This method will construct a `State` object from an ORM model without a loaded
@@ -112,7 +139,7 @@ class State(StateBaseModel, Generic[R]):
         field.
         """
 
-        field_keys = cls.schema()["properties"].keys()
+        field_keys = cls.model_json_schema()["properties"].keys()
         state_data = {
             field: getattr(orm_state, field, None)
             for field in field_keys
@@ -121,30 +148,25 @@ class State(StateBaseModel, Generic[R]):
         state_data["data"] = with_data
         return cls(**state_data)
 
-    @validator("name", always=True)
-    def default_name_from_type(cls, v, *, values, **kwargs):
+    @model_validator(mode="after")
+    def default_name_from_type(self):
         """If a name is not provided, use the type"""
-
         # if `type` is not in `values` it means the `type` didn't pass its own
         # validation check and an error will be raised after this function is called
-        if v is None and values.get("type"):
-            v = " ".join([v.capitalize() for v in values.get("type").value.split("_")])
-        return v
+        name = self.name
+        if name is None and self.type:
+            self.name = " ".join([v.capitalize() for v in self.type.value.split("_")])
+        return self
 
-    @root_validator
-    def default_scheduled_start_time(cls, values):
-        """
-        TODO: This should throw an error instead of setting a default but is out of
-              scope for https://github.com/PrefectHQ/orion/pull/174/ and can be rolled
-              into work refactoring state initialization
-        """
-        if values.get("type") == StateType.SCHEDULED:
-            state_details = values.setdefault(
-                "state_details", cls.__fields__["state_details"].get_default()
-            )
-            if not state_details.scheduled_time:
-                state_details.scheduled_time = pendulum.now("utc")
-        return values
+    @model_validator(mode="after")
+    def default_scheduled_start_time(self):
+        from prefect.server.schemas.states import StateType
+
+        if self.type == StateType.SCHEDULED:
+            if not self.state_details.scheduled_time:
+                self.state_details.scheduled_time = pendulum.now("utc")
+
+        return self
 
     def is_scheduled(self) -> bool:
         return self.type == StateType.SCHEDULED
@@ -167,20 +189,29 @@ class State(StateBaseModel, Generic[R]):
     def is_cancelled(self) -> bool:
         return self.type == StateType.CANCELLED
 
+    def is_cancelling(self) -> bool:
+        return self.type == StateType.CANCELLING
+
     def is_final(self) -> bool:
         return self.type in TERMINAL_STATES
 
     def is_paused(self) -> bool:
         return self.type == StateType.PAUSED
 
-    def copy(self, *, update: dict = None, reset_fields: bool = False, **kwargs):
+    def fresh_copy(self, **kwargs) -> Self:
         """
-        Copying API models should return an object that could be inserted into the
-        database again. The 'timestamp' is reset using the default factory.
+        Return a fresh copy of the state with a new ID.
         """
-        update = update or {}
-        update.setdefault("timestamp", self.__fields__["timestamp"].get_default())
-        return super().copy(reset_fields=reset_fields, update=update, **kwargs)
+        return self.model_copy(
+            update={
+                "id": uuid4(),
+                "created": pendulum.now("utc"),
+                "updated": pendulum.now("utc"),
+                "timestamp": pendulum.now("utc"),
+            },
+            deep=True,
+            **kwargs,
+        )
 
     def result(self, raise_on_failure: bool = True, fetch: Optional[bool] = None):
         # Backwards compatible `result` handling on the server-side schema
@@ -196,25 +227,19 @@ class State(StateBaseModel, Generic[R]):
             stacklevel=2,
         )
 
-        state = State.parse_obj(self)
+        state = State.model_validate(self)
         return state.result(raise_on_failure=raise_on_failure, fetch=fetch)
 
-    def to_state_create(self):
-        # Backwards compatibility for `to_state_create`
-        from prefect.client.schemas import State
+    def to_state_create(self) -> "StateCreate":
+        from prefect.server.schemas.actions import StateCreate
 
-        warnings.warn(
-            (
-                "Use of `prefect.server.schemas.states.State` from the client is"
-                " deprecated and support will be removed in a future release. Use"
-                " `prefect.states.State` instead."
-            ),
-            DeprecationWarning,
-            stacklevel=2,
+        return StateCreate(
+            type=self.type,
+            name=self.name,
+            message=self.message,
+            data=self.data,
+            state_details=self.state_details,
         )
-
-        state = State.parse_obj(self)
-        return state.to_state_create()
 
     def __repr__(self) -> str:
         """
@@ -223,12 +248,7 @@ class State(StateBaseModel, Generic[R]):
 
         `MyCompletedState(message="my message", type=COMPLETED, result=...)`
         """
-        from prefect.deprecated.data_documents import DataDocument
-
-        if isinstance(self.data, DataDocument):
-            result = self.data.decode()
-        else:
-            result = self.data
+        result = self.data
 
         display = dict(
             message=repr(self.message),
@@ -267,7 +287,9 @@ class State(StateBaseModel, Generic[R]):
 
 
 def Scheduled(
-    scheduled_time: datetime.datetime = None, cls: Type[State] = State, **kwargs
+    scheduled_time: Optional[datetime.datetime] = None,
+    cls: Type[State] = State,
+    **kwargs,
 ) -> State:
     """Convenience function for creating `Scheduled` states.
 
@@ -276,7 +298,7 @@ def Scheduled(
     """
     # NOTE: `scheduled_time` must come first for backwards compatibility
 
-    state_details = StateDetails.parse_obj(kwargs.pop("state_details", {}))
+    state_details = StateDetails.model_validate(kwargs.pop("state_details", {}))
     if scheduled_time is None:
         scheduled_time = pendulum.now("UTC")
     elif state_details.scheduled_time:
@@ -351,10 +373,10 @@ def Pending(cls: Type[State] = State, **kwargs) -> State:
 
 def Paused(
     cls: Type[State] = State,
-    timeout_seconds: int = None,
-    pause_expiration_time: datetime.datetime = None,
-    reschedule: bool = False,
-    pause_key: str = None,
+    timeout_seconds: Optional[int] = None,
+    pause_expiration_time: Optional[datetime.datetime] = None,
+    reschedule: Optional[bool] = False,
+    pause_key: Optional[str] = None,
     **kwargs,
 ) -> State:
     """Convenience function for creating `Paused` states.
@@ -362,7 +384,7 @@ def Paused(
     Returns:
         State: a Paused state
     """
-    state_details = StateDetails.parse_obj(kwargs.pop("state_details", {}))
+    state_details = StateDetails.model_validate(kwargs.pop("state_details", {}))
 
     if state_details.pause_timeout:
         raise ValueError("An extra pause timeout was provided in state_details")
@@ -383,6 +405,29 @@ def Paused(
     state_details.pause_key = pause_key
 
     return cls(type=StateType.PAUSED, state_details=state_details, **kwargs)
+
+
+def Suspended(
+    cls: Type[State] = State,
+    timeout_seconds: Optional[int] = None,
+    pause_expiration_time: Optional[datetime.datetime] = None,
+    pause_key: Optional[str] = None,
+    **kwargs,
+):
+    """Convenience function for creating `Suspended` states.
+
+    Returns:
+        State: a Suspended state
+    """
+    return Paused(
+        cls=cls,
+        name="Suspended",
+        reschedule=True,
+        timeout_seconds=timeout_seconds,
+        pause_expiration_time=pause_expiration_time,
+        pause_key=pause_key,
+        **kwargs,
+    )
 
 
 def AwaitingRetry(

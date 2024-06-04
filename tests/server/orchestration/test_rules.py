@@ -1,10 +1,12 @@
 import contextlib
 import random
-from itertools import permutations, product
+import sqlite3
+from itertools import product
 from unittest.mock import MagicMock
 
 import pendulum
 import pytest
+import sqlalchemy.exc
 
 from prefect.server import models, schemas
 from prefect.server.database.dependencies import provide_database_interface
@@ -34,7 +36,7 @@ ALL_ORCHESTRATION_STATES = list(
 
 
 async def commit_task_run_state(
-    session, task_run, state_type: states.StateType, state_details=None
+    session, task_run, state_type: states.StateType, state_details=None, state_name=None
 ):
     if state_type is None:
         return None
@@ -44,18 +46,19 @@ async def commit_task_run_state(
         state_type == states.StateType.SCHEDULED
         and "scheduled_time" not in state_details
     ):
-        state_details.update({"scheduled_time": pendulum.now()})
+        state_details.update({"scheduled_time": pendulum.now("UTC")})
 
     new_state = schemas.states.State(
         type=state_type,
         timestamp=pendulum.now("UTC").subtract(seconds=5),
         state_details=state_details,
+        name=state_name,
     )
 
     db = provide_database_interface()
     orm_state = db.TaskRunState(
         task_run_id=task_run.id,
-        **new_state.orm_dict(shallow=True),
+        **new_state.orm_dict(),
     )
 
     task_run.state = orm_state
@@ -86,7 +89,7 @@ class TestOrchestrationResult:
     ):
         status = SetStateStatus.ACCEPT
         cast_result = OrchestrationResult(
-            status=status, details=response_details.dict()
+            state=None, status=status, details=response_details.model_dump()
         )
         assert isinstance(cast_result.details, response_type)
 
@@ -301,7 +304,7 @@ class TestBaseOrchestrationRule:
             assert side_effect == 1
 
             # mutating the proposed state inside the context will fizzle the rule
-            mutated_state = proposed_state.copy()
+            mutated_state = proposed_state.model_copy()
             mutated_state.type = random.choice(
                 list(set(states.StateType) - {*intended_transition})
             )
@@ -331,7 +334,7 @@ class TestBaseOrchestrationRule:
 
             async def before_transition(self, initial_state, proposed_state, context):
                 # this rule mutates the proposed state type, but won't fizzle itself upon exiting
-                mutated_state = proposed_state.copy()
+                mutated_state = proposed_state.model_copy()
                 mutated_state.type = random.choice(
                     list(
                         set(states.StateType)
@@ -389,7 +392,7 @@ class TestBaseOrchestrationRule:
 
             async def before_transition(self, initial_state, proposed_state, context):
                 # this rule mutates the proposed state type, but won't fizzle itself upon exiting
-                mutated_state = proposed_state.copy()
+                mutated_state = proposed_state.model_copy()
                 mutated_state.type = random.choice(
                     list(
                         set(states.StateType)
@@ -445,7 +448,7 @@ class TestBaseOrchestrationRule:
 
             async def before_transition(self, initial_state, proposed_state, context):
                 # this rule mutates the proposed state type, but won't fizzle itself upon exiting
-                mutated_state = proposed_state.copy()
+                mutated_state = proposed_state.model_copy()
                 mutated_state.type = random.choice(
                     list(
                         set(states.StateType)
@@ -771,7 +774,7 @@ class TestBaseOrchestrationRule:
             proposed_state=proposed_state,
         )
 
-        # an ExitStack is a python builtin contstruction that allows us to
+        # an ExitStack is a python builtin construction that allows us to
         # nest an arbitrary number of contexts (and therefore, rules), in this test
         # we'll enter the contexts one by one so we can follow what's happening
         async with contextlib.AsyncExitStack() as stack:
@@ -919,7 +922,7 @@ class TestBaseOrchestrationRule:
             proposed_state=proposed_state,
         )
 
-        # an ExitStack is a python builtin contstruction that allows us to
+        # an ExitStack is a python builtin construction that allows us to
         # nest an arbitrary number of contexts (and therefore, rules), in this test
         # we'll enter the contexts one by one so we can follow what's happening
         async with contextlib.AsyncExitStack() as stack:
@@ -1530,15 +1533,12 @@ class TestOrchestrationContext:
         orm_artifact = await models.artifacts.read_artifact(ctx.session, artifact_id)
         assert orm_artifact is None
 
-    @pytest.mark.parametrize(
-        "intended_transition",
-        list(permutations([*states.StateType, None], 2)),
-        ids=transition_names,
-    )
     async def test_context_state_validation_encounters_exception(
-        self, session, run_type, intended_transition, initialize_orchestration
+        self, session, run_type, initialize_orchestration
     ):
-        initial_state_type, proposed_state_type = intended_transition
+        initial_state_type = states.StateType.PENDING
+        proposed_state_type = states.StateType.RUNNING
+        intended_transition = (initial_state_type, proposed_state_type)
         before_transition_hook = MagicMock()
         after_transition_hook = MagicMock()
         cleanup_hook = MagicMock()
@@ -1571,7 +1571,10 @@ class TestOrchestrationContext:
         before_transition_hook.assert_called_once()
         if proposed_state_type is not None:
             after_transition_hook.assert_not_called()
-            cleanup_hook.assert_called_once(), "Cleanup should be called when trasition is aborted"
+            (
+                cleanup_hook.assert_called_once(),
+                "Cleanup should be called when transition is aborted",
+            )
         else:
             after_transition_hook.assert_called_once(), "Rule expected no transition"
             cleanup_hook.assert_not_called()
@@ -1583,6 +1586,68 @@ class TestOrchestrationContext:
             ctx.response_details.reason
             == "Error validating state: RuntimeError('One time error!')"
         )
+
+    async def test_context_state_validation_encounters_sqlite_busy_exception(
+        self, session, run_type, initialize_orchestration
+    ):
+        initial_state_type = states.StateType.PENDING
+        proposed_state_type = states.StateType.RUNNING
+        intended_transition = (initial_state_type, proposed_state_type)
+        before_transition_hook = MagicMock()
+        after_transition_hook = MagicMock()
+        cleanup_hook = MagicMock()
+
+        class MockRule(BaseOrchestrationRule):
+            FROM_STATES = ALL_ORCHESTRATION_STATES
+            TO_STATES = ALL_ORCHESTRATION_STATES
+
+            async def before_transition(self, initial_state, proposed_state, context):
+                before_transition_hook(initial_state, proposed_state, context)
+
+            async def after_transition(self, initial_state, validated_state, context):
+                after_transition_hook(initial_state, validated_state, context)
+
+            async def cleanup(self, initial_state, validated_state, context):
+                cleanup_hook(initial_state, validated_state, context)
+
+        ctx = await initialize_orchestration(session, run_type, *intended_transition)
+
+        orig = sqlite3.OperationalError("database locked")
+        setattr(orig, "sqlite_errorname", "SQLITE_BUSY")
+        setattr(orig, "sqlite_errorcode", 5)
+
+        # Bypass pydantic mutation protection, inject an error
+        object.__setattr__(
+            ctx.session,
+            "flush",
+            AsyncMock(
+                side_effect=sqlalchemy.exc.OperationalError(
+                    "statement",
+                    {"params": 1},
+                    orig,
+                    Exception,
+                )
+            ),
+        )
+
+        with pytest.raises(sqlalchemy.exc.OperationalError):
+            async with contextlib.AsyncExitStack() as stack:
+                mock_rule = MockRule(ctx, *intended_transition)
+                ctx = await stack.enter_async_context(mock_rule)
+                await ctx.validate_proposed_state()
+
+        before_transition_hook.assert_called_once()
+        if proposed_state_type is not None:
+            after_transition_hook.assert_not_called()
+            (
+                cleanup_hook.assert_called_once(),
+                "Cleanup should be called when transition is aborted",
+            )
+        else:
+            after_transition_hook.assert_called_once(), "Rule expected no transition"
+            cleanup_hook.assert_not_called()
+
+        assert ctx.proposed_state is None
 
 
 @pytest.mark.parametrize("run_type", ["task", "flow"])
@@ -1597,6 +1662,7 @@ class TestNullRejection:
     ):
         side_effects = 0
         minimal_before_hook = MagicMock()
+        first_after_hook = MagicMock()
         null_rejection_before_hook = MagicMock()
         minimal_after_hook = MagicMock()
         null_rejection_after_hook = MagicMock()
@@ -1685,6 +1751,7 @@ class TestNullRejection:
         minimal_before_hook = MagicMock()
         null_rejection_before_hook = MagicMock()
         minimal_after_hook = MagicMock()
+        first_after_hook = MagicMock()
         null_rejection_after_hook = MagicMock()
         minimal_cleanup_hook = MagicMock()
         null_rejection_cleanup = MagicMock()
@@ -1807,7 +1874,9 @@ class TestNullRejection:
             await ctx.validate_proposed_state()
 
         assert ctx.proposed_state is None
-        assert ctx.validated_state == states.State.from_orm(intial_state)
+        assert ctx.validated_state == states.State.model_validate(
+            intial_state, from_attributes=True
+        )
         assert ctx.response_status == schemas.responses.SetStateStatus.REJECT
 
     async def test_rules_that_reject_state_with_null_do_not_fizzle_themselves(

@@ -1,12 +1,12 @@
 <template>
-  <p-layout-well class="flow-run">
+  <p-layout-default class="flow-run">
     <template #header>
-      <PageHeadingFlowRun v-if="flowRun" :flow-run-id="flowRun.id" @delete="goToFlowRuns" />
+      <PageHeadingFlowRun v-if="flowRun" :flow-run-id="flowRun.id" @delete="goToRuns" />
     </template>
 
-    <FlowRunTimeline v-if="flowRun" :flow-run="flowRun" />
+    <FlowRunGraphs v-if="flowRun && !isPending" :flow-run="flowRun" />
 
-    <p-tabs v-model:selected="selectedTab" :tabs="tabs">
+    <p-tabs v-model:selected="tab" :tabs="tabs">
       <template #details>
         <FlowRunDetails v-if="flowRun" :flow-run="flowRun" />
       </template>
@@ -28,86 +28,84 @@
       </template>
 
       <template #subflow-runs>
-        <FlowRunSubFlows v-if="flowRun" :flow-run-id="flowRun.id" />
+        <FlowRunFilteredList :filter="subflowsFilter" />
       </template>
 
       <template #parameters>
-        <CopyableWrapper v-if="deployment" :text-to-copy="parameters">
+        <CopyableWrapper v-if="flowRun" :text-to-copy="parameters">
           <p-code-highlight lang="json" :text="parameters" class="flow-run__parameters" />
         </CopyableWrapper>
       </template>
-    </p-tabs>
 
-    <template #well>
-      <template v-if="flowRun">
-        <FlowRunDetails :flow-run="flowRun" alternate />
+      <template #job-variables>
+        <CopyableWrapper v-if="flowRun" :text-to-copy="jobVariables">
+          <p-code-highlight lang="json" :text="jobVariables" class="flow-run__job-variables" />
+        </CopyableWrapper>
       </template>
-    </template>
-  </p-layout-well>
+    </p-tabs>
+  </p-layout-default>
 </template>
 
 <script lang="ts" setup>
-  import { media } from '@prefecthq/prefect-design'
   import {
     PageHeadingFlowRun,
     FlowRunArtifacts,
     FlowRunDetails,
     FlowRunLogs,
     FlowRunTaskRuns,
-    FlowRunTimeline,
     FlowRunResults,
-    FlowRunSubFlows,
+    FlowRunFilteredList,
     useFavicon,
-    useWorkspaceApi,
-    useDeployment,
-    getSchemaValuesWithDefaultsJson,
-    CopyableWrapper
+    CopyableWrapper,
+    isPendingStateType,
+    useTabs,
+    httpStatus,
+    useFlowRun,
+    useFlowRunsFilter,
+    stringify
   } from '@prefecthq/prefect-ui-library'
-  import { useSubscription, useRouteParam } from '@prefecthq/vue-compositions'
-  import { computed, ref, watch } from 'vue'
+  import { useRouteParam, useRouteQueryParam } from '@prefecthq/vue-compositions'
+  import { computed, watchEffect } from 'vue'
   import { useRouter } from 'vue-router'
+  import FlowRunGraphs from '@/components/FlowRunGraphs.vue'
   import { usePageTitle } from '@/compositions/usePageTitle'
   import { routes } from '@/router'
 
+
   const router = useRouter()
-
-  const selectedTab = ref('Logs')
   const flowRunId = useRouteParam('flowRunId')
-  const tabs = computed(() => {
-    const values = [
-      'Logs',
-      'Task Runs',
-      'Results',
-      'Artifacts',
-      'Subflow Runs',
-      'Parameters',
-    ]
 
-    if (!media.xl) {
-      values.push('Details')
-    }
+  const { flowRun, subscription: flowRunSubscription } = useFlowRun(flowRunId, { interval: 5000 })
+  const parameters = computed(() => stringify(flowRun.value?.parameters ?? {}))
 
-    return values
+  const isPending = computed(() => {
+    return flowRun.value?.stateType ? isPendingStateType(flowRun.value.stateType) : true
   })
 
-  const api = useWorkspaceApi()
-  const flowRunDetailsSubscription = useSubscription(api.flowRuns.getFlowRun, [flowRunId], { interval: 5000 })
-  const flowRun = computed(() => flowRunDetailsSubscription.response)
-  const deploymentId = computed(() => flowRun.value?.deploymentId)
-  const { deployment } = useDeployment(deploymentId)
+  const jobVariables = computed(() => stringify(flowRun.value?.jobVariables ?? {}))
 
-  watch(flowRunId, (oldFlowRunId, newFlowRunId) => {
-    if (oldFlowRunId !== newFlowRunId) {
-      selectedTab.value = 'Logs'
-    }
+  const computedTabs = computed(() => [
+    { label: 'Logs' },
+    { label: 'Task Runs', hidden: isPending.value },
+    { label: 'Subflow Runs', hidden: isPending.value },
+    { label: 'Results', hidden: isPending.value },
+    { label: 'Artifacts', hidden: isPending.value },
+    { label: 'Details' },
+    { label: 'Parameters' },
+    { label: 'Job Variables' },
+  ])
+  const tab = useRouteQueryParam('tab', 'Logs')
+  const { tabs } = useTabs(computedTabs, tab)
+
+  const parentFlowRunIds = computed(() => [flowRunId.value])
+  const { filter: subflowsFilter } = useFlowRunsFilter({
+    flowRuns: {
+      parentFlowRunId: parentFlowRunIds,
+    },
   })
 
-  const flowRunParameters = computed(() => flowRun.value?.parameters ?? {})
-  const deploymentSchema = computed(() => deployment.value?.parameterOpenApiSchema ?? {})
-  const parameters = computed(() => getSchemaValuesWithDefaultsJson(flowRunParameters.value, deploymentSchema.value))
-
-  function goToFlowRuns(): void {
-    router.push(routes.flowRuns())
+  function goToRuns(): void {
+    router.push(routes.runs())
   }
 
   const stateType = computed(() => flowRun.value?.stateType)
@@ -120,6 +118,16 @@
     return `Flow Run: ${flowRun.value.name}`
   })
   usePageTitle(title)
+
+  watchEffect(() => {
+    if (flowRunSubscription.error) {
+      const status = httpStatus(flowRunSubscription.error)
+
+      if (status.isInRange('clientError')) {
+        router.replace(routes[404]())
+      }
+    }
+  })
 </script>
 
 <style>
@@ -138,6 +146,7 @@
   xl:hidden
 }
 
+.flow-run__job-variables,
 .flow-run__parameters { @apply
   px-4
   py-3

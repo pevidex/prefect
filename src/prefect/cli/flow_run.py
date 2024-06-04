@@ -1,27 +1,30 @@
 """
 Command line interface for working with flow runs
 """
+
 import logging
-from typing import List
+import os
+from typing import List, Optional
 from uuid import UUID
 
 import httpx
 import pendulum
 import typer
-from fastapi import status
 from rich.pretty import Pretty
 from rich.table import Table
+from starlette import status
 
-import prefect.server.schemas as schemas
 from prefect.cli._types import PrefectTyper
 from prefect.cli._utilities import exit_with_error, exit_with_success
-from prefect.cli.root import app
+from prefect.cli.root import app, is_interactive
 from prefect.client.orchestration import get_client
+from prefect.client.schemas.filters import FlowFilter, FlowRunFilter, LogFilter
+from prefect.client.schemas.objects import StateType
+from prefect.client.schemas.responses import SetStateStatus
+from prefect.client.schemas.sorting import FlowRunSort, LogSort
 from prefect.exceptions import ObjectNotFound
-from prefect.server.schemas.filters import FlowFilter, FlowRunFilter, LogFilter
-from prefect.server.schemas.responses import SetStateStatus
-from prefect.server.schemas.sorting import FlowRunSort
-from prefect.server.schemas.states import StateType
+from prefect.logging import get_logger
+from prefect.runner import Runner
 from prefect.states import State
 
 flow_run_app = PrefectTyper(
@@ -31,6 +34,8 @@ app.add_typer(flow_run_app, aliases=["flow-runs"])
 
 LOGS_DEFAULT_PAGE_SIZE = 200
 LOGS_WITH_LIMIT_FLAG_DEFAULT_NUM_LOGS = 20
+
+logger = get_logger(__name__)
 
 
 @flow_run_app.command()
@@ -55,19 +60,80 @@ async def ls(
     flow_name: List[str] = typer.Option(None, help="Name of the flow"),
     limit: int = typer.Option(15, help="Maximum number of flow runs to list"),
     state: List[str] = typer.Option(None, help="Name of the flow run's state"),
-    state_type: List[StateType] = typer.Option(
-        None, help="Type of the flow run's state"
-    ),
+    state_type: List[str] = typer.Option(None, help="Type of the flow run's state"),
 ):
     """
-    View recent flow runs or flow runs for specific flows
+    View recent flow runs or flow runs for specific flows.
+
+    Arguments:
+
+        flow_name: Name of the flow
+
+        limit: Maximum number of flow runs to list. Defaults to 15.
+
+        state: Name of the flow run's state. Can be provided multiple times. Options are 'SCHEDULED', 'PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CRASHED', 'CANCELLING', 'CANCELLED', 'PAUSED', 'SUSPENDED', 'AWAITINGRETRY', 'RETRYING', and 'LATE'.
+
+        state_type: Type of the flow run's state. Can be provided multiple times. Options are 'SCHEDULED', 'PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CRASHED', 'CANCELLING', 'CANCELLED', 'CRASHED', and 'PAUSED'.
+
+    Examples:
+
+    $ prefect flow-runs ls --state Running
+
+    $ prefect flow-runs ls --state Running --state late
+
+    $ prefect flow-runs ls --state-type RUNNING
+
+    $ prefect flow-runs ls --state-type RUNNING --state-type FAILED
     """
 
+    # Handling `state` and `state_type` argument validity in the function instead of by specifying
+    # List[StateType] and List[StateName] in the type hints, allows users to provide
+    # case-insensitive arguments for `state` and `state_type`.
+
+    prefect_state_names = {
+        "SCHEDULED": "Scheduled",
+        "PENDING": "Pending",
+        "RUNNING": "Running",
+        "COMPLETED": "Completed",
+        "FAILED": "Failed",
+        "CANCELLED": "Cancelled",
+        "CRASHED": "Crashed",
+        "PAUSED": "Paused",
+        "CANCELLING": "Cancelling",
+        "SUSPENDED": "Suspended",
+        "AWAITINGRETRY": "AwaitingRetry",
+        "RETRYING": "Retrying",
+        "LATE": "Late",
+    }
+
     state_filter = {}
+    formatted_states = []
+
     if state:
-        state_filter["name"] = {"any_": state}
+        for s in state:
+            uppercased_state = s.upper()
+            if uppercased_state in prefect_state_names:
+                capitalized_state = prefect_state_names[uppercased_state]
+                formatted_states.append(capitalized_state)
+            else:
+                # Do not change the case of the state name if it is not one of the official Prefect state names
+                formatted_states.append(s)
+                logger.warning(
+                    f"State name {repr(s)} is not one of the official Prefect state names."
+                )
+
+        state_filter["name"] = {"any_": formatted_states}
+
     if state_type:
-        state_filter["type"] = {"any_": state_type}
+        upper_cased_states = [s.upper() for s in state_type]
+        if not all(s in StateType.__members__ for s in upper_cased_states):
+            exit_with_error(
+                f"Invalid state type. Options are {', '.join(StateType.__members__)}."
+            )
+
+        state_filter["type"] = {
+            "any_": [StateType[s].value for s in upper_cased_states]
+        }
 
     async with get_client() as client:
         flow_runs = await client.read_flow_runs(
@@ -82,6 +148,9 @@ async def ls(
                 flow_filter=FlowFilter(id={"any_": [run.flow_id for run in flow_runs]})
             )
         }
+
+        if not flow_runs:
+            exit_with_success("No flow runs found.")
 
     table = Table(title="Flow Runs")
     table.add_column("ID", justify="right", style="cyan", no_wrap=True)
@@ -115,8 +184,13 @@ async def delete(id: UUID):
     """
     async with get_client() as client:
         try:
+            if is_interactive() and not typer.confirm(
+                (f"Are you sure you want to delete flow run with id {id!r}?"),
+                default=False,
+            ):
+                exit_with_error("Deletion aborted.")
             await client.delete_flow_run(id)
-        except ObjectNotFound as exc:
+        except ObjectNotFound:
             exit_with_error(f"Flow run '{id}' not found!")
 
     exit_with_success(f"Successfully deleted flow run '{id}'.")
@@ -131,7 +205,7 @@ async def cancel(id: UUID):
             result = await client.set_flow_run_state(
                 flow_run_id=id, state=cancelling_state
             )
-        except ObjectNotFound as exc:
+        except ObjectNotFound:
             exit_with_error(f"Flow run '{id}' not found!")
 
     if result.status == SetStateStatus.ABORT:
@@ -140,7 +214,7 @@ async def cancel(id: UUID):
             f" '{result.details.reason}'"
         )
 
-    exit_with_success(f"Flow run '{id}' was succcessfully scheduled for cancellation.")
+    exit_with_success(f"Flow run '{id}' was successfully scheduled for cancellation.")
 
 
 @flow_run_app.command()
@@ -160,8 +234,8 @@ async def logs(
         "--num-logs",
         "-n",
         help=(
-            "Number of logs to show when using the --head flag. If None, defaults to"
-            f" {LOGS_WITH_LIMIT_FLAG_DEFAULT_NUM_LOGS}."
+            "Number of logs to show when using the --head or --tail flag. If None,"
+            f" defaults to {LOGS_WITH_LIMIT_FLAG_DEFAULT_NUM_LOGS}."
         ),
         min=1,
     ),
@@ -170,6 +244,15 @@ async def logs(
         "--reverse",
         "-r",
         help="Reverse the logs order to print the most recent logs first",
+    ),
+    tail: bool = typer.Option(
+        False,
+        "--tail",
+        "-t",
+        help=(
+            f"Show the last {LOGS_WITH_LIMIT_FLAG_DEFAULT_NUM_LOGS} logs instead of"
+            " all logs."
+        ),
     ),
 ):
     """
@@ -180,11 +263,19 @@ async def logs(
     more_logs = True
     num_logs_returned = 0
 
-    # If head is specified, we need to stop after we've retrieved enough logs
-    if head or num_logs:
-        user_specified_num_logs = num_logs or LOGS_WITH_LIMIT_FLAG_DEFAULT_NUM_LOGS
-    else:
-        user_specified_num_logs = None
+    # if head and tail flags are being used together
+    if head and tail:
+        exit_with_error("Please provide either a `head` or `tail` option but not both.")
+
+    user_specified_num_logs = (
+        num_logs or LOGS_WITH_LIMIT_FLAG_DEFAULT_NUM_LOGS
+        if head or tail or num_logs
+        else None
+    )
+
+    # if using tail update offset according to LOGS_DEFAULT_PAGE_SIZE
+    if tail:
+        offset = max(0, user_specified_num_logs - LOGS_DEFAULT_PAGE_SIZE)
 
     log_filter = LogFilter(flow_run_id={"any_": [id]})
 
@@ -192,14 +283,16 @@ async def logs(
         # Get the flow run
         try:
             flow_run = await client.read_flow_run(id)
-        except ObjectNotFound as exc:
+        except ObjectNotFound:
             exit_with_error(f"Flow run {str(id)!r} not found!")
 
         while more_logs:
             num_logs_to_return_from_page = (
                 LOGS_DEFAULT_PAGE_SIZE
                 if user_specified_num_logs is None
-                else min(LOGS_DEFAULT_PAGE_SIZE, user_specified_num_logs)
+                else min(
+                    LOGS_DEFAULT_PAGE_SIZE, user_specified_num_logs - num_logs_returned
+                )
             )
 
             # Get the next page of logs
@@ -208,14 +301,11 @@ async def logs(
                 limit=num_logs_to_return_from_page,
                 offset=offset,
                 sort=(
-                    schemas.sorting.LogSort.TIMESTAMP_DESC
-                    if reverse
-                    else schemas.sorting.LogSort.TIMESTAMP_ASC
+                    LogSort.TIMESTAMP_DESC if reverse or tail else LogSort.TIMESTAMP_ASC
                 ),
             )
 
-            # Print the logs
-            for log in page_logs:
+            for log in reversed(page_logs) if tail and not reverse else page_logs:
                 app.console.print(
                     # Print following the flow run format (declared in logging.yml)
                     (
@@ -229,8 +319,35 @@ async def logs(
             # Update the number of logs retrieved
             num_logs_returned += num_logs_to_return_from_page
 
-            if len(page_logs) == LOGS_DEFAULT_PAGE_SIZE:
-                offset += LOGS_DEFAULT_PAGE_SIZE
+            if tail:
+                #  If the current offset is not 0, update the offset for the next page
+                if offset != 0:
+                    offset = (
+                        0
+                        # Reset the offset to 0 if there are less logs than the LOGS_DEFAULT_PAGE_SIZE to get the remaining log
+                        if offset < LOGS_DEFAULT_PAGE_SIZE
+                        else offset - LOGS_DEFAULT_PAGE_SIZE
+                    )
+                else:
+                    more_logs = False
             else:
-                # No more logs to show, exit
-                more_logs = False
+                if len(page_logs) == LOGS_DEFAULT_PAGE_SIZE:
+                    offset += LOGS_DEFAULT_PAGE_SIZE
+                else:
+                    # No more logs to show, exit
+                    more_logs = False
+
+
+@flow_run_app.command()
+async def execute(
+    id: Optional[UUID] = typer.Argument(None, help="ID of the flow run to execute"),
+):
+    if id is None:
+        environ_flow_id = os.environ.get("PREFECT__FLOW_RUN_ID")
+        if environ_flow_id:
+            id = UUID(environ_flow_id)
+
+    if id is None:
+        exit_with_error("Could not determine the ID of the flow run to execute.")
+
+    await Runner().execute_flow_run(id)

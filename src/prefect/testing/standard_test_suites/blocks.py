@@ -22,16 +22,16 @@ class BlockStandardTestSuite(ABC):
         assert block._documentation_url
 
     def test_all_fields_have_a_description(self, block: Type[Block]):
-        for name, field in block.__fields__.items():
-            if Block.is_block_class(field.type_):
-                # TODO: Block field descriptions aren't currently handled by the UI, so block
-                # fields are currently excluded from this test. Once block field descriptions are
-                # supported by the UI, remove this clause.
+        for name, field in block.model_fields.items():
+            if Block.annotation_refers_to_block_class(field.annotation):
+                # TODO: Block field descriptions aren't currently handled by the UI, so
+                # block fields are currently excluded from this test. Once block field
+                # descriptions are supported by the UI, remove this clause.
                 continue
             assert (
-                field.field_info.description
+                field.description
             ), f"{block.__name__} is missing a description on {name}"
-            assert field.field_info.description.endswith(
+            assert field.description.endswith(
                 "."
             ), f"{name} description on {block.__name__} does not end with a period"
 
@@ -55,7 +55,7 @@ class BlockStandardTestSuite(ABC):
             logo_url is not None
         ), f"{block.__name__} is missing a value for _logo_url"
         img = Image.open(urlopen(logo_url))
-        assert img.width == img.height, f"Logo should be a square image"
+        assert img.width == img.height, "Logo should be a square image"
         assert (
             1000 > img.width > 45
         ), f"Logo should be between 200px and 1000px wid, but is {img.width}px wide"

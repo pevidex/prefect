@@ -1,18 +1,19 @@
 """
 Utilities for Prefect CLI commands
 """
+
 import functools
 import traceback
+from typing import NoReturn
 
 import typer
-import typer.core
 from click.exceptions import ClickException
 
 from prefect.exceptions import MissingProfileError
 from prefect.settings import PREFECT_TEST_MODE
 
 
-def exit_with_error(message, code=1, **kwargs):
+def exit_with_error(message, code=1, **kwargs) -> NoReturn:
     """
     Utility to print a stylized error message and exit with a non-zero code
     """

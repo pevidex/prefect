@@ -1,10 +1,12 @@
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Type
+from typing import TYPE_CHECKING, Dict, Optional, Type
 
 import yaml
-from pydantic import Field, validator
+from pydantic import Field, field_validator
 from typing_extensions import Self
 
+from prefect._internal.compatibility.deprecated import deprecated_class
+from prefect._internal.schemas.validators import validate_yaml
 from prefect.blocks.core import Block
 from prefect.utilities.collections import listrepr
 from prefect.utilities.importtools import lazy_import
@@ -16,6 +18,10 @@ else:
     kubernetes = lazy_import("kubernetes")
 
 
+@deprecated_class(
+    start_date="Mar 2024",
+    help="Use the KubernetesClusterConfig block from prefect-kubernetes instead.",
+)
 class KubernetesClusterConfig(Block):
     """
     Stores configuration for interaction with Kubernetes clusters.
@@ -36,7 +42,7 @@ class KubernetesClusterConfig(Block):
     """
 
     _block_type_name = "Kubernetes Cluster Config"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/1zrSeY8DZ1MJZs2BAyyyGk/20445025358491b8b72600b8f996125b/Kubernetes_logo_without_workmark.svg.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/2d0b896006ad463b49c28aaac14f31e00e32cfab-250x250.png"
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/kubernetes/#prefect.blocks.kubernetes.KubernetesClusterConfig"
 
     config: Dict = Field(
@@ -46,14 +52,15 @@ class KubernetesClusterConfig(Block):
         default=..., description="The name of the kubectl context to use."
     )
 
-    @validator("config", pre=True)
+    @field_validator("config", mode="before")
+    @classmethod
     def parse_yaml_config(cls, value):
-        if isinstance(value, str):
-            return yaml.safe_load(value)
-        return value
+        return validate_yaml(value)
 
     @classmethod
-    def from_file(cls: Type[Self], path: Path = None, context_name: str = None) -> Self:
+    def from_file(
+        cls: Type[Self], path: Optional[Path] = None, context_name: Optional[str] = None
+    ) -> Self:
         """
         Create a cluster config from the a Kubernetes config file.
 

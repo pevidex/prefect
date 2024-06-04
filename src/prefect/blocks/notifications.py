@@ -1,32 +1,17 @@
+import logging
 from abc import ABC
 from typing import Dict, List, Optional
 
-import apprise
-from apprise import Apprise, AppriseAsset, NotifyType
-from apprise.plugins.NotifyMattermost import NotifyMattermost
-from apprise.plugins.NotifyOpsgenie import NotifyOpsgenie
-from apprise.plugins.NotifyPagerDuty import NotifyPagerDuty
-from apprise.plugins.NotifyTwilio import NotifyTwilio
 from pydantic import AnyHttpUrl, Field, SecretStr
 from typing_extensions import Literal
 
-from prefect.blocks.abstract import NotificationBlock
-from prefect.events.instrument import instrument_instance_method_call
+from prefect.blocks.abstract import NotificationBlock, NotificationError
+from prefect.logging import LogEavesdropper
+from prefect.types import SecretDict
 from prefect.utilities.asyncutils import sync_compatible
+from prefect.utilities.templating import apply_values, find_placeholders
 
-
-class PrefectNotifyType(NotifyType):
-    """
-    A mapping of Prefect notification types for use with Apprise.
-
-    Attributes:
-        DEFAULT: A plain notification that does not insert any notification type images.
-    """
-
-    DEFAULT = "prefect_default"
-
-
-apprise.NOTIFY_TYPES += (PrefectNotifyType.DEFAULT,)
+PREFECT_NOTIFY_TYPE_DEFAULT = "prefect_default"
 
 
 class AbstractAppriseNotificationBlock(NotificationBlock, ABC):
@@ -34,17 +19,27 @@ class AbstractAppriseNotificationBlock(NotificationBlock, ABC):
     An abstract class for sending notifications using Apprise.
     """
 
-    notify_type: Literal["prefect_default", "info", "success", "warning", "failure"] = (
-        Field(
-            default=PrefectNotifyType.DEFAULT,
-            description=(
-                "The type of notification being performed; the prefect_default "
-                "is a plain notification that does not attach an image."
-            ),
-        )
+    notify_type: Literal[
+        "prefect_default", "info", "success", "warning", "failure"
+    ] = Field(
+        default=PREFECT_NOTIFY_TYPE_DEFAULT,
+        description=(
+            "The type of notification being performed; the prefect_default "
+            "is a plain notification that does not attach an image."
+        ),
     )
 
+    def __init__(self, *args, **kwargs):
+        import apprise
+
+        if PREFECT_NOTIFY_TYPE_DEFAULT not in apprise.NOTIFY_TYPES:
+            apprise.NOTIFY_TYPES += (PREFECT_NOTIFY_TYPE_DEFAULT,)
+
+        super().__init__(*args, **kwargs)
+
     def _start_apprise_client(self, url: SecretStr):
+        from apprise import Apprise, AppriseAsset
+
         # A custom `AppriseAsset` that ensures Prefect Notifications
         # appear correctly across multiple messaging platforms
         prefect_app_data = AppriseAsset(
@@ -60,11 +55,17 @@ class AbstractAppriseNotificationBlock(NotificationBlock, ABC):
         self._start_apprise_client(self.url)
 
     @sync_compatible
-    @instrument_instance_method_call()
-    async def notify(self, body: str, subject: Optional[str] = None):
-        await self._apprise_client.async_notify(
-            body=body, title=subject, notify_type=self.notify_type
-        )
+    async def notify(
+        self,
+        body: str,
+        subject: Optional[str] = None,
+    ):
+        with LogEavesdropper("apprise", level=logging.DEBUG) as eavesdropper:
+            result = await self._apprise_client.async_notify(
+                body=body, title=subject, notify_type=self.notify_type
+            )
+        if not result and self._raise_on_failure:
+            raise NotificationError(log=eavesdropper.text())
 
 
 class AppriseNotificationBlock(AbstractAppriseNotificationBlock, ABC):
@@ -77,7 +78,7 @@ class AppriseNotificationBlock(AbstractAppriseNotificationBlock, ABC):
         default=...,
         title="Webhook URL",
         description="Incoming webhook URL used to send notifications.",
-        example="https://hooks.example.com/XXX",
+        examples=["https://hooks.example.com/XXX"],
     )
 
 
@@ -98,14 +99,14 @@ class SlackWebhook(AppriseNotificationBlock):
     """
 
     _block_type_name = "Slack Webhook"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/7dkzINU9r6j44giEFuHuUC/85d4cd321ad60c1b1e898bc3fbd28580/5cb480cd5f1b6d3fbadece79.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/c1965ecbf8704ee1ea20d77786de9a41ce1087d1-500x500.png"
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/notifications/#prefect.blocks.notifications.SlackWebhook"
 
     url: SecretStr = Field(
         default=...,
         title="Webhook URL",
         description="Slack incoming webhook URL used to send notifications.",
-        example="https://hooks.slack.com/XXX",
+        examples=["https://hooks.slack.com/XXX"],
     )
 
 
@@ -124,16 +125,16 @@ class MicrosoftTeamsWebhook(AppriseNotificationBlock):
 
     _block_type_name = "Microsoft Teams Webhook"
     _block_type_slug = "ms-teams-webhook"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/6n0dSTBzwoVPhX8Vgg37i7/9040e07a62def4f48242be3eae6d3719/teams_logo.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/817efe008a57f0a24f3587414714b563e5e23658-250x250.png"
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/notifications/#prefect.blocks.notifications.MicrosoftTeamsWebhook"
 
     url: SecretStr = Field(
         ...,
         title="Webhook URL",
         description="The Teams incoming webhook URL used to send notifications.",
-        example=(
+        examples=[
             "https://your-org.webhook.office.com/webhookb2/XXX/IncomingWebhook/YYY/ZZZ"
-        ),
+        ],
     )
 
 
@@ -156,7 +157,7 @@ class PagerDutyWebHook(AbstractAppriseNotificationBlock):
 
     _block_type_name = "Pager Duty Webhook"
     _block_type_slug = "pager-duty-webhook"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/6FHJ4Lcozjfl1yDPxCvQDT/c2f6bdf47327271c068284897527f3da/PagerDuty-Logo.wine.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/8dbf37d17089c1ce531708eac2e510801f7b3aee-250x250.png"
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/notifications/#prefect.blocks.notifications.PagerDutyWebHook"
 
     # The default cannot be prefect_default because NotifyPagerDuty's
@@ -222,10 +223,17 @@ class PagerDutyWebHook(AbstractAppriseNotificationBlock):
     custom_details: Optional[Dict[str, str]] = Field(
         default=None,
         description="Additional details to include as part of the payload.",
-        example='{"disk_space_left": "145GB"}',
+        examples=['{"disk_space_left": "145GB"}'],
     )
 
     def block_initialization(self) -> None:
+        try:
+            # Try importing for apprise>=1.18.0
+            from apprise.plugins.pagerduty import NotifyPagerDuty
+        except ImportError:
+            # Fallback for versions apprise<1.18.0
+            from apprise.plugins.NotifyPagerDuty import NotifyPagerDuty
+
         url = SecretStr(
             NotifyPagerDuty(
                 apikey=self.api_key.get_secret_value(),
@@ -259,7 +267,7 @@ class TwilioSMS(AbstractAppriseNotificationBlock):
     _description = "Enables sending notifications via Twilio SMS."
     _block_type_name = "Twilio SMS"
     _block_type_slug = "twilio-sms"
-    _logo_url = "https://images.ctfassets.net/zscdif0zqppk/YTCgPL6bnK3BczP2gV9md/609283105a7006c57dbfe44ee1a8f313/58482bb9cef1014c0b5e4a31.png?h=250"  # noqa
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/8bd8777999f82112c09b9c8d57083ac75a4a0d65-250x250.png"  # noqa
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/notifications/#prefect.blocks.notifications.TwilioSMS"
 
     account_sid: str = Field(
@@ -281,17 +289,23 @@ class TwilioSMS(AbstractAppriseNotificationBlock):
     from_phone_number: str = Field(
         default=...,
         description="The valid Twilio phone number to send the message from.",
-        example="18001234567",
+        examples=["18001234567"],
     )
 
     to_phone_numbers: List[str] = Field(
         default=...,
         description="A list of valid Twilio phone number(s) to send the message to.",
         # not wrapped in brackets because of the way UI displays examples; in code should be ["18004242424"]
-        example="18004242424",
+        examples=["18004242424"],
     )
 
     def block_initialization(self) -> None:
+        try:
+            # Try importing for apprise>=1.18.0
+            from apprise.plugins.twilio import NotifyTwilio
+        except ImportError:
+            # Fallback for versions apprise<1.18.0
+            from apprise.plugins.NotifyTwilio import NotifyTwilio
         url = SecretStr(
             NotifyTwilio(
                 account_sid=self.account_sid,
@@ -322,7 +336,7 @@ class OpsgenieWebhook(AbstractAppriseNotificationBlock):
 
     _block_type_name = "Opsgenie Webhook"
     _block_type_slug = "opsgenie-webhook"
-    _logo_url = "https://images.ctfassets.net/sahxz1jinscj/3habq8fTzmplh7Ctkppk4/590cecb73f766361fcea9223cd47bad8/opsgenie.png"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/d8b5bc6244ae6cd83b62ec42f10d96e14d6e9113-280x280.png"
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/notifications/#prefect.blocks.notifications.OpsgenieWebhook"
 
     apikey: SecretStr = Field(
@@ -362,10 +376,10 @@ class OpsgenieWebhook(AbstractAppriseNotificationBlock):
             "A comma-separated list of tags you can associate with your Opsgenie"
             " message."
         ),
-        example='["tag1", "tag2"]',
+        examples=['["tag1", "tag2"]'],
     )
 
-    priority: Optional[str] = Field(
+    priority: Optional[int] = Field(
         default=3,
         description=(
             "The priority to associate with the message. It is on a scale between 1"
@@ -384,10 +398,17 @@ class OpsgenieWebhook(AbstractAppriseNotificationBlock):
     details: Optional[Dict[str, str]] = Field(
         default=None,
         description="Additional details composed of key/values pairs.",
-        example='{"key1": "value1", "key2": "value2"}',
+        examples=['{"key1": "value1", "key2": "value2"}'],
     )
 
     def block_initialization(self) -> None:
+        try:
+            # Try importing for apprise>=1.18.0
+            from apprise.plugins.opsgenie import NotifyOpsgenie
+        except ImportError:
+            # Fallback for versions apprise<1.18.0
+            from apprise.plugins.NotifyOpsgenie import NotifyOpsgenie
+
         targets = []
         if self.target_user:
             [targets.append(f"@{x}") for x in self.target_user]
@@ -433,13 +454,13 @@ class MattermostWebhook(AbstractAppriseNotificationBlock):
     _description = "Enables sending notifications via a provided Mattermost webhook."
     _block_type_name = "Mattermost Webhook"
     _block_type_slug = "mattermost-webhook"
-    _logo_url = "https://images.ctfassets.net/zscdif0zqppk/3mlbsJDAmK402ER1sf0zUF/a48ac43fa38f395dd5f56c6ed29f22bb/mattermost-logo-png-transparent.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/1350a147130bf82cbc799a5f868d2c0116207736-250x250.png"
     _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/notifications/#prefect.blocks.notifications.MattermostWebhook"
 
     hostname: str = Field(
         default=...,
         description="The hostname of your Mattermost server.",
-        example="Mattermost.example.com",
+        examples=["Mattermost.example.com"],
     )
 
     token: SecretStr = Field(
@@ -474,6 +495,13 @@ class MattermostWebhook(AbstractAppriseNotificationBlock):
     )
 
     def block_initialization(self) -> None:
+        try:
+            # Try importing for apprise>=1.18.0
+            from apprise.plugins.mattermost import NotifyMattermost
+        except ImportError:
+            # Fallback for versions apprise<1.18.0
+            from apprise.plugins.NotifyMattermost import NotifyMattermost
+
         url = SecretStr(
             NotifyMattermost(
                 token=self.token.get_secret_value(),
@@ -485,4 +513,294 @@ class MattermostWebhook(AbstractAppriseNotificationBlock):
                 port=self.port,
             ).url()
         )
+        self._start_apprise_client(url)
+
+
+class DiscordWebhook(AbstractAppriseNotificationBlock):
+    """
+    Enables sending notifications via a provided Discord webhook.
+    See [Apprise notify_Discord docs](https://github.com/caronc/apprise/wiki/Notify_Discord) # noqa
+
+    Examples:
+        Load a saved Discord webhook and send a message:
+        ```python
+        from prefect.blocks.notifications import DiscordWebhook
+
+        discord_webhook_block = DiscordWebhook.load("BLOCK_NAME")
+
+        discord_webhook_block.notify("Hello from Prefect!")
+        ```
+    """
+
+    _description = "Enables sending notifications via a provided Discord webhook."
+    _block_type_name = "Discord Webhook"
+    _block_type_slug = "discord-webhook"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/9e94976c80ef925b66d24e5d14f0d47baa6b8f88-250x250.png"
+    _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/notifications/#prefect.blocks.notifications.DiscordWebhook"
+
+    webhook_id: SecretStr = Field(
+        default=...,
+        description=(
+            "The first part of 2 tokens provided to you after creating a"
+            " incoming-webhook."
+        ),
+    )
+
+    webhook_token: SecretStr = Field(
+        default=...,
+        description=(
+            "The second part of 2 tokens provided to you after creating a"
+            " incoming-webhook."
+        ),
+    )
+
+    botname: Optional[str] = Field(
+        title="Bot name",
+        default=None,
+        description=(
+            "Identify the name of the bot that should issue the message. If one isn't"
+            " specified then the default is to just use your account (associated with"
+            " the incoming-webhook)."
+        ),
+    )
+
+    tts: bool = Field(
+        default=False,
+        description="Whether to enable Text-To-Speech.",
+    )
+
+    include_image: bool = Field(
+        default=False,
+        description=(
+            "Whether to include an image in-line with the message describing the"
+            " notification type."
+        ),
+    )
+
+    avatar: bool = Field(
+        default=False,
+        description="Whether to override the default discord avatar icon.",
+    )
+
+    avatar_url: Optional[str] = Field(
+        title="Avatar URL",
+        default=False,
+        description=(
+            "Over-ride the default discord avatar icon URL. By default this is not set"
+            " and Apprise chooses the URL dynamically based on the type of message"
+            " (info, success, warning, or error)."
+        ),
+    )
+
+    def block_initialization(self) -> None:
+        try:
+            # Try importing for apprise>=1.18.0
+            from apprise.plugins.discord import NotifyDiscord
+        except ImportError:
+            # Fallback for versions apprise<1.18.0
+            from apprise.plugins.NotifyDiscord import NotifyDiscord
+
+        url = SecretStr(
+            NotifyDiscord(
+                webhook_id=self.webhook_id.get_secret_value(),
+                webhook_token=self.webhook_token.get_secret_value(),
+                botname=self.botname,
+                tts=self.tts,
+                include_image=self.include_image,
+                avatar=self.avatar,
+                avatar_url=self.avatar_url,
+            ).url()
+        )
+        self._start_apprise_client(url)
+
+
+class CustomWebhookNotificationBlock(NotificationBlock):
+    """
+    Enables sending notifications via any custom webhook.
+
+    All nested string param contains `{{key}}` will be substituted with value from context/secrets.
+
+    Context values include: `subject`, `body` and `name`.
+
+    Examples:
+        Load a saved custom webhook and send a message:
+        ```python
+        from prefect.blocks.notifications import CustomWebhookNotificationBlock
+
+        custom_webhook_block = CustomWebhookNotificationBlock.load("BLOCK_NAME")
+
+        custom_webhook_block.notify("Hello from Prefect!")
+        ```
+    """
+
+    _block_type_name = "Custom Webhook"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/c7247cb359eb6cf276734d4b1fbf00fb8930e89e-250x250.png"
+    _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/notifications/#prefect.blocks.notifications.CustomWebhookNotificationBlock"
+
+    name: str = Field(title="Name", description="Name of the webhook.")
+
+    url: str = Field(
+        title="Webhook URL",
+        description="The webhook URL.",
+        examples=["https://hooks.slack.com/XXX"],
+    )
+
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = Field(
+        default="POST", description="The webhook request method. Defaults to `POST`."
+    )
+
+    params: Optional[Dict[str, str]] = Field(
+        default=None, title="Query Params", description="Custom query params."
+    )
+    json_data: Optional[dict] = Field(
+        default=None,
+        title="JSON Data",
+        description="Send json data as payload.",
+        examples=[
+            '{"text": "{{subject}}\\n{{body}}", "title": "{{name}}", "token":'
+            ' "{{tokenFromSecrets}}"}'
+        ],
+    )
+    form_data: Optional[Dict[str, str]] = Field(
+        default=None,
+        title="Form Data",
+        description=(
+            "Send form data as payload. Should not be used together with _JSON Data_."
+        ),
+        examples=[
+            '{"text": "{{subject}}\\n{{body}}", "title": "{{name}}", "token":'
+            ' "{{tokenFromSecrets}}"}'
+        ],
+    )
+
+    headers: Optional[Dict[str, str]] = Field(None, description="Custom headers.")
+    cookies: Optional[Dict[str, str]] = Field(None, description="Custom cookies.")
+
+    timeout: float = Field(
+        default=10, description="Request timeout in seconds. Defaults to 10."
+    )
+
+    secrets: SecretDict = Field(
+        default_factory=lambda: SecretDict(dict()),
+        title="Custom Secret Values",
+        description="A dictionary of secret values to be substituted in other configs.",
+        examples=['{"tokenFromSecrets":"SomeSecretToken"}'],
+    )
+
+    def _build_request_args(self, body: str, subject: Optional[str]):
+        """Build kwargs for httpx.AsyncClient.request"""
+        # prepare values
+        values = self.secrets.get_secret_value()
+        # use 'null' when subject is None
+        values.update(
+            {
+                "subject": "null" if subject is None else subject,
+                "body": body,
+                "name": self.name,
+            }
+        )
+        # do substution
+        return apply_values(
+            {
+                "method": self.method,
+                "url": self.url,
+                "params": self.params,
+                "data": self.form_data,
+                "json": self.json_data,
+                "headers": self.headers,
+                "cookies": self.cookies,
+                "timeout": self.timeout,
+            },
+            values,
+        )
+
+    def block_initialization(self) -> None:
+        # check form_data and json_data
+        if self.form_data is not None and self.json_data is not None:
+            raise ValueError("both `Form Data` and `JSON Data` provided")
+        allowed_keys = {"subject", "body", "name"}.union(
+            self.secrets.get_secret_value().keys()
+        )
+        # test template to raise a error early
+        for name in ["url", "params", "form_data", "json_data", "headers", "cookies"]:
+            template = getattr(self, name)
+            if template is None:
+                continue
+            # check for placeholders not in predefined keys and secrets
+            placeholders = find_placeholders(template)
+            for placeholder in placeholders:
+                if placeholder.name not in allowed_keys:
+                    raise KeyError(f"{name}/{placeholder}")
+
+    @sync_compatible
+    async def notify(self, body: str, subject: Optional[str] = None):
+        import httpx
+
+        request_args = self._build_request_args(body, subject)
+        cookies = request_args.pop("cookies", None)
+        # make request with httpx
+        client = httpx.AsyncClient(
+            headers={"user-agent": "Prefect Notifications"}, cookies=cookies
+        )
+        async with client:
+            resp = await client.request(**request_args)
+        resp.raise_for_status()
+
+
+class SendgridEmail(AbstractAppriseNotificationBlock):
+    """
+    Enables sending notifications via any sendgrid account.
+    See [Apprise Notify_sendgrid docs](https://github.com/caronc/apprise/wiki/Notify_Sendgrid)
+
+    Examples:
+        Load a saved Sendgrid and send a email message:
+        ```python
+        from prefect.blocks.notifications import SendgridEmail
+
+        sendgrid_block = SendgridEmail.load("BLOCK_NAME")
+
+        sendgrid_block.notify("Hello from Prefect!")
+    """
+
+    _description = "Enables sending notifications via Sendgrid email service."
+    _block_type_name = "Sendgrid Email"
+    _block_type_slug = "sendgrid-email"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/82bc6ed16ca42a2252a5512c72233a253b8a58eb-250x250.png"
+    _documentation_url = "https://docs.prefect.io/api-ref/prefect/blocks/notifications/#prefect.blocks.notifications.SendgridEmail"
+
+    api_key: SecretStr = Field(
+        default=...,
+        title="API Key",
+        description="The API Key associated with your sendgrid account.",
+    )
+
+    sender_email: str = Field(
+        title="Sender email id",
+        description="The sender email id.",
+        examples=["test-support@gmail.com"],
+    )
+
+    to_emails: List[str] = Field(
+        default=...,
+        title="Recipient emails",
+        description="Email ids of all recipients.",
+        examples=['"recipient1@gmail.com"'],
+    )
+
+    def block_initialization(self) -> None:
+        try:
+            # Try importing for apprise>=1.18.0
+            from apprise.plugins.sendgrid import NotifySendGrid
+        except ImportError:
+            # Fallback for versions apprise<1.18.0
+            from apprise.plugins.NotifySendGrid import NotifySendGrid
+
+        url = SecretStr(
+            NotifySendGrid(
+                apikey=self.api_key.get_secret_value(),
+                from_email=self.sender_email,
+                targets=self.to_emails,
+            ).url()
+        )
+
         self._start_apprise_client(url)

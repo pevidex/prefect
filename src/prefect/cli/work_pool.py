@@ -1,26 +1,35 @@
 """
 Command line interface for working with work queues.
 """
-from typing import Any, Dict, Optional, Set
+
+import json
+import textwrap
 
 import pendulum
 import typer
 from rich.pretty import Pretty
 from rich.table import Table
 
-from prefect import get_client
-from prefect._internal.compatibility.experimental import (
-    experimental,
-    experimental_parameter,
-)
+from prefect.cli._prompts import prompt_select_from_table
 from prefect.cli._types import PrefectTyper
-from prefect.cli._utilities import exit_with_error, exit_with_success
-from prefect.cli.root import app
+from prefect.cli._utilities import (
+    exit_with_error,
+    exit_with_success,
+)
+from prefect.cli.root import app, is_interactive
+from prefect.client.collections import get_collections_metadata_client
+from prefect.client.orchestration import get_client
+from prefect.client.schemas.actions import WorkPoolCreate, WorkPoolUpdate
 from prefect.exceptions import ObjectAlreadyExists, ObjectNotFound
-from prefect.server.schemas.actions import WorkPoolCreate, WorkPoolUpdate
-from prefect.settings import PREFECT_API_KEY, PREFECT_API_URL, PREFECT_CLOUD_API_URL
-from prefect.utilities.dispatch import get_registry_for_type
-from prefect.workers.base import BaseWorker
+from prefect.infrastructure.provisioners import (
+    _provisioners,
+    get_infrastructure_provisioner_for_work_pool_type,
+)
+from prefect.settings import PREFECT_UI_URL, update_current_profile
+from prefect.workers.utilities import (
+    get_available_work_pool_types,
+    get_default_base_job_template_for_infrastructure_type,
+)
 
 work_pool_app = PrefectTyper(
     name="work-pool", help="Commands for working with work pools."
@@ -28,24 +37,69 @@ work_pool_app = PrefectTyper(
 app.add_typer(work_pool_app, aliases=["work-pool"])
 
 
+def set_work_pool_as_default(name: str):
+    profile = update_current_profile({"PREFECT_DEFAULT_WORK_POOL_NAME": name})
+    app.console.print(
+        f"Set {name!r} as default work pool for profile {profile.name!r}\n",
+        style="green",
+    )
+    app.console.print(
+        (
+            "To change your default work pool, run:\n\n\t[blue]prefect config set"
+            " PREFECT_DEFAULT_WORK_POOL_NAME=<work-pool-name>[/]\n"
+        ),
+    )
+
+
+def has_provisioner_for_type(work_pool_type: str) -> bool:
+    """
+    Check if there is a provisioner for the given work pool type.
+
+    Args:
+        work_pool_type (str): The type of the work pool.
+
+    Returns:
+        bool: True if a provisioner exists for the given type, False otherwise.
+    """
+    return work_pool_type in _provisioners
+
+
 @work_pool_app.command()
-@experimental(
-    feature="The Work Pool CLI",
-    group="work_pools",
-)
-@experimental_parameter(
-    name="type",
-    group="work_pools",
-)
 async def create(
     name: str = typer.Argument(..., help="The name of the work pool."),
+    base_job_template: typer.FileText = typer.Option(
+        None,
+        "--base-job-template",
+        help=(
+            "The path to a JSON file containing the base job template to use. If"
+            " unspecified, Prefect will use the default base job template for the given"
+            " worker type."
+        ),
+    ),
     paused: bool = typer.Option(
         False,
         "--paused",
         help="Whether or not to create the work pool in a paused state.",
     ),
     type: str = typer.Option(
-        "prefect-agent", "-t", "--type", help="The type of work pool to create."
+        None, "-t", "--type", help="The type of work pool to create."
+    ),
+    set_as_default: bool = typer.Option(
+        False,
+        "--set-as-default",
+        help=(
+            "Whether or not to use the created work pool as the local default for"
+            " deployment."
+        ),
+    ),
+    provision_infrastructure: bool = typer.Option(
+        False,
+        "--provision-infrastructure",
+        "--provision-infra",
+        help=(
+            "Whether or not to provision infrastructure for the work pool if supported"
+            " for the given work pool type."
+        ),
     ),
 ):
     """
@@ -53,36 +107,142 @@ async def create(
 
     \b
     Examples:
-        $ prefect work-pool create "my-pool" --paused
+        \b
+        Create a Kubernetes work pool in a paused state:
+            \b
+            $ prefect work-pool create "my-pool" --type kubernetes --paused
+        \b
+        Create a Docker work pool with a custom base job template:
+            \b
+            $ prefect work-pool create "my-pool" --type docker --base-job-template ./base-job-template.json
+
     """
-    # will always be an empty dict until workers added
-    base_job_template = await get_default_base_job_template_for_type(type)
-    if base_job_template is None:
-        exit_with_error(
-            f"Unknown work pool type {type!r}. "
-            f"Please choose from {', '.join(await get_available_work_pool_types())}."
-        )
+    if not name.lower().strip("'\" "):
+        exit_with_error("Work pool name cannot be empty.")
     async with get_client() as client:
+        try:
+            await client.read_work_pool(work_pool_name=name)
+        except ObjectNotFound:
+            pass
+        else:
+            exit_with_error(
+                f"Work pool named {name!r} already exists. Please try creating your"
+                " work pool again with a different name."
+            )
+
+        if type is None:
+            async with get_collections_metadata_client() as collections_client:
+                if not is_interactive():
+                    exit_with_error(
+                        "When not using an interactive terminal, you must supply a"
+                        " `--type` value."
+                    )
+                worker_metadata = await collections_client.read_worker_metadata()
+
+                # Retrieve only push pools if provisioning infrastructure
+                data = [
+                    worker
+                    for collection in worker_metadata.values()
+                    for worker in collection.values()
+                    if provision_infrastructure
+                    and has_provisioner_for_type(worker["type"])
+                    or not provision_infrastructure
+                ]
+                worker = prompt_select_from_table(
+                    app.console,
+                    "What type of work pool infrastructure would you like to use?",
+                    columns=[
+                        {"header": "Infrastructure Type", "key": "display_name"},
+                        {"header": "Description", "key": "description"},
+                    ],
+                    data=data,
+                    table_kwargs={"show_lines": True},
+                )
+                type = worker["type"]
+
+        available_work_pool_types = await get_available_work_pool_types()
+        if type not in available_work_pool_types:
+            exit_with_error(
+                f"Unknown work pool type {type!r}. "
+                "Please choose from"
+                f" {', '.join(available_work_pool_types)}."
+            )
+
+        if base_job_template is None:
+            template_contents = (
+                await get_default_base_job_template_for_infrastructure_type(type)
+            )
+        else:
+            template_contents = json.load(base_job_template)
+
+        if provision_infrastructure:
+            try:
+                provisioner = get_infrastructure_provisioner_for_work_pool_type(type)
+                provisioner.console = app.console
+                template_contents = await provisioner.provision(
+                    work_pool_name=name, base_job_template=template_contents
+                )
+            except ValueError as exc:
+                print(exc)
+                app.console.print(
+                    (
+                        "Automatic infrastructure provisioning is not supported for"
+                        f" {type!r} work pools."
+                    ),
+                    style="yellow",
+                )
+            except RuntimeError as exc:
+                exit_with_error(f"Failed to provision infrastructure: {exc}")
+
         try:
             wp = WorkPoolCreate(
                 name=name,
                 type=type,
-                base_job_template=base_job_template,
+                base_job_template=template_contents,
                 is_paused=paused,
             )
             work_pool = await client.create_work_pool(work_pool=wp)
-            exit_with_success(f"Created work pool {work_pool.name!r}.")
+            app.console.print(f"Created work pool {work_pool.name!r}!\n", style="green")
+            if (
+                not work_pool.is_paused
+                and not work_pool.is_managed_pool
+                and not work_pool.is_push_pool
+            ):
+                app.console.print("To start a worker for this work pool, run:\n")
+                app.console.print(
+                    f"\t[blue]prefect worker start --pool {work_pool.name}[/]\n"
+                )
+            if set_as_default:
+                set_work_pool_as_default(work_pool.name)
+
+            if PREFECT_UI_URL:
+                pool_url = (
+                    f"{PREFECT_UI_URL.value()}/work-pools/work-pool/{work_pool.name}"
+                )
+            else:
+                pool_url = "<no dashboard available>"
+
+            app.console.print(
+                textwrap.dedent(
+                    f"""
+                └── UUID: {work_pool.id}
+                └── Type: {work_pool.type}
+                └── Description: {work_pool.description}
+                └── Status: {work_pool.status.display_name}
+                └── URL: {pool_url}
+                """
+                ).strip(),
+                soft_wrap=True,
+            )
+            exit_with_success("")
         except ObjectAlreadyExists:
             exit_with_error(
-                f"Work pool {name} already exists. Please choose a different name."
+                f"Work pool named {name!r} already exists. Please try creating your"
+                " work pool again with a different name."
             )
 
 
 @work_pool_app.command()
-@experimental(
-    feature="The Work Pool CLI",
-    group="work_pools",
-)
 async def ls(
     verbose: bool = typer.Option(
         False,
@@ -111,7 +271,8 @@ async def ls(
     async with get_client() as client:
         pools = await client.read_work_pools()
 
-    sort_by_created_key = lambda q: pendulum.now("utc") - q.created
+    def sort_by_created_key(q):
+        return pendulum.now("utc") - q.created
 
     for pool in sorted(pools, key=sort_by_created_key):
         row = [
@@ -120,7 +281,7 @@ async def ls(
             str(pool.id),
             (
                 f"[red]{pool.concurrency_limit}"
-                if pool.concurrency_limit
+                if pool.concurrency_limit is not None
                 else "[blue]None"
             ),
         ]
@@ -132,10 +293,6 @@ async def ls(
 
 
 @work_pool_app.command()
-@experimental(
-    feature="The Work Pool CLI",
-    group="work_pools",
-)
 async def inspect(
     name: str = typer.Argument(..., help="The name of the work pool to inspect."),
 ):
@@ -150,17 +307,12 @@ async def inspect(
     async with get_client() as client:
         try:
             pool = await client.read_work_pool(work_pool_name=name)
-        except ObjectNotFound as exc:
-            exit_with_error(exc)
-
-        app.console.print(Pretty(pool))
+            app.console.print(Pretty(pool))
+        except ObjectNotFound:
+            exit_with_error(f"Work pool {name!r} not found!")
 
 
 @work_pool_app.command()
-@experimental(
-    feature="The Work Pool CLI",
-    group="work_pools",
-)
 async def pause(
     name: str = typer.Argument(..., help="The name of the work pool to pause."),
 ):
@@ -187,10 +339,6 @@ async def pause(
 
 
 @work_pool_app.command()
-@experimental(
-    feature="The Work Pool CLI",
-    group="work_pools",
-)
 async def resume(
     name: str = typer.Argument(..., help="The name of the work pool to resume."),
 ):
@@ -217,10 +365,123 @@ async def resume(
 
 
 @work_pool_app.command()
-@experimental(
-    feature="The Work Pool CLI",
-    group="work_pools",
-)
+async def update(
+    name: str = typer.Argument(..., help="The name of the work pool to update."),
+    base_job_template: typer.FileText = typer.Option(
+        None,
+        "--base-job-template",
+        help=(
+            "The path to a JSON file containing the base job template to use. If"
+            " unspecified, Prefect will use the default base job template for the given"
+            " worker type. If None, the base job template will not be modified."
+        ),
+    ),
+    concurrency_limit: int = typer.Option(
+        None,
+        "--concurrency-limit",
+        help=(
+            "The concurrency limit for the work pool. If None, the concurrency limit"
+            " will not be modified."
+        ),
+    ),
+    description: str = typer.Option(
+        None,
+        "--description",
+        help=(
+            "The description for the work pool. If None, the description will not be"
+            " modified."
+        ),
+    ),
+):
+    """
+    Update a work pool.
+
+    \b
+    Examples:
+        $ prefect work-pool update "my-pool"
+
+    """
+    wp = WorkPoolUpdate()
+    if base_job_template:
+        wp.base_job_template = json.load(base_job_template)
+    if concurrency_limit:
+        wp.concurrency_limit = concurrency_limit
+    if description:
+        wp.description = description
+
+    async with get_client() as client:
+        try:
+            await client.update_work_pool(
+                work_pool_name=name,
+                work_pool=wp,
+            )
+        except ObjectNotFound:
+            exit_with_error("Work pool named {name!r} does not exist.")
+
+        exit_with_success(f"Updated work pool {name!r}")
+
+
+@work_pool_app.command(aliases=["provision-infra"])
+async def provision_infrastructure(
+    name: str = typer.Argument(
+        ..., help="The name of the work pool to provision infrastructure for."
+    ),
+):
+    """
+    Provision infrastructure for a work pool.
+
+    \b
+    Examples:
+        $ prefect work-pool provision-infrastructure "my-pool"
+
+        $ prefect work-pool provision-infra "my-pool"
+
+    """
+    async with get_client() as client:
+        try:
+            work_pool = await client.read_work_pool(work_pool_name=name)
+            if not work_pool.is_push_pool:
+                exit_with_error(
+                    f"Work pool {name!r} is not a push pool type. "
+                    "Please try provisioning infrastructure for a push pool."
+                )
+        except ObjectNotFound:
+            exit_with_error(f"Work pool {name!r} does not exist.")
+        except Exception as exc:
+            exit_with_error(f"Failed to read work pool {name!r}: {exc}")
+
+        try:
+            provisioner = get_infrastructure_provisioner_for_work_pool_type(
+                work_pool.type
+            )
+            provisioner.console = app.console
+            new_base_job_template = await provisioner.provision(
+                work_pool_name=name, base_job_template=work_pool.base_job_template
+            )
+
+            await client.update_work_pool(
+                work_pool_name=name,
+                work_pool=WorkPoolUpdate(
+                    base_job_template=new_base_job_template,
+                ),
+            )
+
+        except ValueError as exc:
+            app.console.print(f"Error: {exc}")
+            app.console.print(
+                (
+                    "Automatic infrastructure provisioning is not supported for"
+                    f" {work_pool.type!r} work pools."
+                ),
+                style="yellow",
+            )
+        except RuntimeError as exc:
+            exit_with_error(
+                f"Failed to provision infrastructure for '{name}' work pool: {exc}"
+            )
+
+
+@work_pool_app.command()
 async def delete(
     name: str = typer.Argument(..., help="The name of the work pool to delete."),
 ):
@@ -234,6 +495,11 @@ async def delete(
     """
     async with get_client() as client:
         try:
+            if is_interactive() and not typer.confirm(
+                (f"Are you sure you want to delete work pool with name {name!r}?"),
+                default=False,
+            ):
+                exit_with_error("Deletion aborted.")
             await client.delete_work_pool(work_pool_name=name)
         except ObjectNotFound as exc:
             exit_with_error(exc)
@@ -242,10 +508,6 @@ async def delete(
 
 
 @work_pool_app.command()
-@experimental(
-    feature="The Work Pool CLI",
-    group="work_pools",
-)
 async def set_concurrency_limit(
     name: str = typer.Argument(..., help="The name of the work pool to update."),
     concurrency_limit: int = typer.Argument(
@@ -277,10 +539,6 @@ async def set_concurrency_limit(
 
 
 @work_pool_app.command()
-@experimental(
-    feature="The Work Pool CLI",
-    group="work_pools",
-)
 async def clear_concurrency_limit(
     name: str = typer.Argument(..., help="The name of the work pool to update."),
 ):
@@ -307,10 +565,42 @@ async def clear_concurrency_limit(
 
 
 @work_pool_app.command()
-@experimental(
-    feature="The Work Pool CLI",
-    group="work_pools",
-)
+async def get_default_base_job_template(
+    type: str = typer.Option(
+        None,
+        "-t",
+        "--type",
+        help="The type of work pool for which to get the default base job template.",
+    ),
+    file: str = typer.Option(
+        None, "-f", "--file", help="If set, write the output to a file."
+    ),
+):
+    """
+    Get the default base job template for a given work pool type.
+
+    \b
+    Examples:
+        $ prefect work-pool get-default-base-job-template --type kubernetes
+    """
+    base_job_template = await get_default_base_job_template_for_infrastructure_type(
+        type
+    )
+    if base_job_template is None:
+        exit_with_error(
+            f"Unknown work pool type {type!r}. "
+            "Please choose from"
+            f" {', '.join(await get_available_work_pool_types())}."
+        )
+
+    if file is None:
+        print(json.dumps(base_job_template, indent=2))
+    else:
+        with open(file, mode="w") as f:
+            json.dump(base_job_template, fp=f, indent=2)
+
+
+@work_pool_app.command()
 async def preview(
     name: str = typer.Argument(None, help="The name or ID of the work pool to preview"),
     hours: int = typer.Option(
@@ -349,10 +639,13 @@ async def preview(
     table.add_column("Name", style="green", no_wrap=True)
     table.add_column("Deployment ID", style="blue", no_wrap=True)
 
-    window = pendulum.now("utc").add(hours=hours or 1)
+    pendulum.now("utc").add(hours=hours or 1)
 
     now = pendulum.now("utc")
-    sort_by_created_key = lambda r: now - r.created
+
+    def sort_by_created_key(r):
+        return now - r.created
+
     for run in sorted(runs, key=sort_by_created_key):
         table.add_row(
             (
@@ -375,63 +668,3 @@ async def preview(
             ),
             style="yellow",
         )
-
-
-async def get_default_base_job_template_for_type(type: str) -> Optional[Dict[str, Any]]:
-    # Attempt to get the default base job template for the worker type
-    # from the local type registry first.
-    worker_registry = get_registry_for_type(BaseWorker)
-    if worker_registry is not None:
-        worker_cls = worker_registry.get(type)
-        if worker_cls is not None:
-            return worker_cls.get_default_base_job_template()
-
-    # If the worker type is not found in the local type registry, attempt to
-    # get the default base job template from the collections registry.
-    try:
-        worker_metadata = await _get_worker_metadata()
-
-        for collection in worker_metadata.values():
-            for worker in collection.values():
-                if worker.get("type") == type:
-                    return worker.get("default_base_job_configuration")
-    except Exception as exc:
-        return None
-
-
-async def get_available_work_pool_types() -> Set[str]:
-    work_pool_types = []
-    worker_registry = get_registry_for_type(BaseWorker)
-    if worker_registry is not None:
-        work_pool_types.extend(worker_registry.keys())
-
-    try:
-        worker_metadata = await _get_worker_metadata()
-        for collection in worker_metadata.values():
-            for worker in collection.values():
-                work_pool_types.append(worker.get("type"))
-    except Exception:
-        # Return only work pool types from the local type registry if
-        # the request to the collections registry fails.
-        pass
-
-    return set([type for type in work_pool_types if type is not None])
-
-
-async def _get_worker_metadata() -> Dict[str, Any]:
-    # TODO: Clean this up and move to a more appropriate location
-    # This might need to be its own client
-    httpx_settings = {}
-    base_url = (
-        PREFECT_CLOUD_API_URL.value()
-        if PREFECT_API_KEY.value() is not None
-        else PREFECT_API_URL.value()
-    )
-    if base_url:
-        httpx_settings["base_url"] = base_url
-    async with get_client(httpx_settings=httpx_settings) as client:
-        response = await client._client.get(
-            "collections/views/aggregate-worker-metadata"
-        )
-        response.raise_for_status()
-        return response.json()

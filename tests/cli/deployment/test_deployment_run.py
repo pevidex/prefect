@@ -1,28 +1,47 @@
+import uuid
+from functools import partial
+from unittest.mock import ANY, AsyncMock
+
 import pendulum
 import pytest
 from pendulum.datetime import DateTime
 from pendulum.duration import Duration
 
 import prefect
+from prefect.client.schemas.objects import FlowRun
+from prefect.exceptions import FlowRunWaitTimeout
+from prefect.states import Completed, Failed
 from prefect.testing.cli import invoke_and_assert
 from prefect.utilities.asyncutils import run_sync_in_worker_thread
 
 
 @pytest.fixture
-async def deployment_name(deployment, orion_client):
-    flow = await orion_client.read_flow(deployment.flow_id)
+async def deployment_name(deployment, prefect_client):
+    flow = await prefect_client.read_flow(deployment.flow_id)
     return f"{flow.name}/{deployment.name}"
 
 
 @pytest.fixture
 def frozen_now(monkeypatch):
-    now = pendulum.now()
+    now = pendulum.now("UTC")
     monkeypatch.setattr("pendulum.now", lambda *_: now)
     yield now
 
 
+def completed_flow_run():
+    return FlowRun(
+        id=uuid.uuid4(), flow_id=uuid.uuid4(), state=Completed(), work_pool_id=None
+    )
+
+
+def failed_flow_run():
+    return FlowRun(
+        id=uuid.uuid4(), flow_id=uuid.uuid4(), state=Failed(), work_pool_id=None
+    )
+
+
 async def test_run_deployment_only_creates_one_flow_run(
-    deployment_name: str, orion_client: prefect.PrefectClient, deployment
+    deployment_name: str, prefect_client: prefect.PrefectClient, deployment
 ):
     await run_sync_in_worker_thread(
         invoke_and_assert,
@@ -33,7 +52,7 @@ async def test_run_deployment_only_creates_one_flow_run(
         ],
     )
 
-    flow_runs = await orion_client.read_flow_runs()
+    flow_runs = await prefect_client.read_flow_runs()
     assert len(flow_runs) == 1
     flow_run = flow_runs[0]
 
@@ -158,7 +177,7 @@ async def test_start_at_option_schedules_flow_run(
     deployment_name: str,
     start_at: str,
     expected_start_time: DateTime,
-    orion_client: prefect.PrefectClient,
+    prefect_client: prefect.PrefectClient,
 ):
     expected_display = expected_start_time.to_datetime_string()
 
@@ -174,7 +193,7 @@ async def test_start_at_option_schedules_flow_run(
         expected_output_contains=f"Scheduled start time: {expected_display}",
     )
 
-    flow_runs = await orion_client.read_flow_runs()
+    flow_runs = await prefect_client.read_flow_runs()
     assert len(flow_runs) == 1
     flow_run = flow_runs[0]
 
@@ -198,7 +217,7 @@ async def test_start_at_option_with_tz_schedules_flow_run(
     deployment_name: str,
     start_at: str,
     expected_start_time: DateTime,
-    orion_client: prefect.PrefectClient,
+    prefect_client: prefect.PrefectClient,
 ):
     expected_start_time_local = expected_start_time.in_tz(pendulum.tz.local_timezone())
     expected_display = (
@@ -219,7 +238,7 @@ async def test_start_at_option_with_tz_schedules_flow_run(
         expected_output_contains=f"Scheduled start time: {expected_display}",
     )
 
-    flow_runs = await orion_client.read_flow_runs()
+    flow_runs = await prefect_client.read_flow_runs()
     assert len(flow_runs) == 1
     flow_run = flow_runs[0]
 
@@ -300,7 +319,7 @@ async def test_start_in_option_displays_scheduled_start_time(
 async def test_start_in_option_schedules_flow_run(
     deployment_name: str,
     frozen_now: DateTime,
-    orion_client: prefect.PrefectClient,
+    prefect_client: prefect.PrefectClient,
     start_in: str,
     expected_duration: Duration,
 ):
@@ -321,7 +340,7 @@ async def test_start_in_option_schedules_flow_run(
         expected_output_contains=f"Scheduled start time: {expected_display}",
     )
 
-    flow_runs = await orion_client.read_flow_runs()
+    flow_runs = await prefect_client.read_flow_runs()
     assert len(flow_runs) == 1
     flow_run = flow_runs[0]
 
@@ -352,7 +371,7 @@ async def test_date_as_start_in_option_schedules_flow_run_equal_to_start_at(
     deployment_name: str,
     start_time: str,
     expected_start_time: DateTime,
-    orion_client: prefect.PrefectClient,
+    prefect_client: prefect.PrefectClient,
 ):
     """
     Passing a date (rather than something like `5 minutes`) as an argument to start_in results in a scheduled flow run,
@@ -392,7 +411,7 @@ async def test_date_as_start_in_option_schedules_flow_run_equal_to_start_at(
         expected_output_contains=f"Scheduled start time: {expected_display}",
     )
 
-    flow_runs = await orion_client.read_flow_runs()
+    flow_runs = await prefect_client.read_flow_runs()
 
     assert len(flow_runs) == 2
     start_at_flow_run = flow_runs[0]
@@ -405,3 +424,122 @@ async def test_date_as_start_in_option_schedules_flow_run_equal_to_start_at(
 
     assert start_at_scheduled_time == expected_start_time
     assert start_in_scheduled_time == expected_start_time
+
+
+async def test_print_parameter_validation_error(deployment_with_parameter_schema, flow):
+    await run_sync_in_worker_thread(
+        invoke_and_assert,
+        command=[
+            "deployment",
+            "run",
+            f"{flow.name}/{deployment_with_parameter_schema.name}",
+            "-p",
+            "x=1",
+        ],
+        expected_code=1,
+        expected_output_contains=(
+            "Validation failed for field 'x'. Failure reason: 1 is not of type 'string'"
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "test_case, mock_wait_for_flow_run, timeout, expected_output, expected_code",
+    [
+        (
+            "pass",
+            AsyncMock(return_value=completed_flow_run()),
+            None,
+            "Flow run finished successfully",
+            0,
+        ),
+        (
+            "fail",
+            AsyncMock(return_value=failed_flow_run()),
+            None,
+            "Flow run finished in state 'Failed'",
+            1,
+        ),
+        (
+            "timeout",
+            AsyncMock(side_effect=FlowRunWaitTimeout("Timeout occurred")),
+            10,
+            "Timeout occurred",
+            1,
+        ),
+    ],
+    ids=["watch-pass", "watch-fail", "watch-timeout"],
+)
+async def test_run_deployment_watch(
+    monkeypatch,
+    deployment,
+    deployment_name,
+    prefect_client,
+    test_case,
+    mock_wait_for_flow_run,
+    timeout,
+    expected_output,
+    expected_code,
+):
+    monkeypatch.setattr(
+        "prefect.cli.deployment.wait_for_flow_run", mock_wait_for_flow_run
+    )
+
+    deployment_run_with_watch_command = partial(
+        invoke_and_assert,
+        command=["deployment", "run", deployment_name, "--watch"]
+        + (["--watch-timeout", str(timeout)] if timeout else [])
+        + ["--tag", "cool-tag"],
+        expected_output_contains=expected_output,
+        expected_code=expected_code,
+    )
+
+    if test_case == "timeout":
+        with pytest.raises(FlowRunWaitTimeout):
+            await run_sync_in_worker_thread(deployment_run_with_watch_command)
+    else:
+        await run_sync_in_worker_thread(deployment_run_with_watch_command)
+
+    assert len(flow_runs := await prefect_client.read_flow_runs()) == 1
+    flow_run = flow_runs[0]
+    assert flow_run.deployment_id == deployment.id
+
+    assert flow_run.state.is_scheduled()
+
+    assert set(flow_run.tags) == set(["cool-tag", "test"])
+    mock_wait_for_flow_run.assert_awaited_once_with(
+        flow_run.id,
+        timeout=timeout,
+        poll_interval=ANY,
+        log_states=ANY,
+    )
+
+
+@pytest.mark.parametrize("arg_name", ["-jv", "--job-variable"])
+async def test_deployment_runs_with_job_variables(
+    deployment_name: str,
+    prefect_client: prefect.PrefectClient,
+    arg_name: str,
+):
+    """
+    Verify that job variables created on the CLI are passed onto the flow run.
+    """
+    job_vars = {"foo": "bar", "1": 2, "baz": "qux"}
+
+    # assemble the command string from the job_vars
+    job_vars_command = ""
+    for k, v in job_vars.items():
+        job_vars_command += f"{arg_name} {k}={v} "
+
+    command = ["deployment", "run", deployment_name]
+    command.extend(job_vars_command.split())
+
+    await run_sync_in_worker_thread(
+        invoke_and_assert,
+        command=command,
+        expected_output_contains=f"Job Variables: {job_vars}",
+    )
+
+    flow_runs = await prefect_client.read_flow_runs()
+    this_run = flow_runs[0]
+    assert this_run.job_variables == job_vars

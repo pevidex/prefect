@@ -191,7 +191,7 @@ class TestReadTaskRuns:
         assert len(result) == 0
 
     async def test_read_task_runs_filters_by_task_run_names(self, flow_run, session):
-        task_run_1 = await models.task_runs.create_task_run(
+        await models.task_runs.create_task_run(
             session=session,
             task_run=schemas.core.TaskRun(
                 flow_run_id=flow_run.id,
@@ -303,7 +303,7 @@ class TestReadTaskRuns:
                 flow_run_id=flow_run.id, task_key="my-key", dynamic_key="0"
             ),
         )
-        task_run_state_1 = await models.task_runs.set_task_run_state(
+        await models.task_runs.set_task_run_state(
             session=session,
             task_run_id=task_run_1.id,
             state=Scheduled(),
@@ -314,7 +314,7 @@ class TestReadTaskRuns:
                 flow_run_id=flow_run.id, task_key="my-key-2", dynamic_key="0"
             ),
         )
-        task_run_state_2 = await models.task_runs.set_task_run_state(
+        await models.task_runs.set_task_run_state(
             session=session,
             task_run_id=task_run_2.id,
             state=schemas.states.Completed(),
@@ -355,7 +355,7 @@ class TestReadTaskRuns:
     async def test_read_task_runs_filters_by_task_run_start_time(
         self, flow_run, session
     ):
-        now = pendulum.now()
+        now = pendulum.now("UTC")
         task_run_1 = await models.task_runs.create_task_run(
             session=session,
             task_run=schemas.core.TaskRun(
@@ -445,6 +445,44 @@ class TestReadTaskRuns:
             ),
         )
         assert {res.id for res in result} == {task_run_1.id, task_run_2.id}
+
+    async def test_read_task_runs_filters_by_flow_run_id(self, flow_run, session):
+        task_run_1 = await models.task_runs.create_task_run(
+            session=session,
+            task_run=schemas.core.TaskRun(
+                flow_run_id=flow_run.id, task_key="my-key", dynamic_key="0"
+            ),
+        )
+        task_run_2 = await models.task_runs.create_task_run(
+            session=session,
+            task_run=schemas.core.TaskRun(
+                flow_run_id=None, task_key="my-key-2", dynamic_key="0"
+            ),
+        )
+
+        all_result = await models.task_runs.read_task_runs(
+            session=session,
+            task_run_filter=schemas.filters.TaskRunFilter(
+                flow_run_id=schemas.filters.TaskRunFilterFlowRunId(is_null_=None)
+            ),
+        )
+        assert {res.id for res in all_result} == {task_run_1.id, task_run_2.id}
+
+        flow_run_tasks_result = await models.task_runs.read_task_runs(
+            session=session,
+            task_run_filter=schemas.filters.TaskRunFilter(
+                flow_run_id=schemas.filters.TaskRunFilterFlowRunId(is_null_=False)
+            ),
+        )
+        assert {res.id for res in flow_run_tasks_result} == {task_run_1.id}
+
+        autonomous_tasks_result = await models.task_runs.read_task_runs(
+            session=session,
+            task_run_filter=schemas.filters.TaskRunFilter(
+                flow_run_id=schemas.filters.TaskRunFilterFlowRunId(is_null_=True)
+            ),
+        )
+        assert {res.id for res in autonomous_tasks_result} == {task_run_2.id}
 
     async def test_read_task_runs_filters_by_flow_run_criteria(self, flow_run, session):
         task_run_1 = await models.task_runs.create_task_run(
@@ -590,13 +628,13 @@ class TestReadTaskRuns:
         assert len(result) == 0
 
     async def test_read_task_runs_applies_limit(self, flow_run, session):
-        task_run_1 = await models.task_runs.create_task_run(
+        await models.task_runs.create_task_run(
             session=session,
             task_run=schemas.core.TaskRun(
                 flow_run_id=flow_run.id, task_key="my-key", dynamic_key="0"
             ),
         )
-        task_run_2 = await models.task_runs.create_task_run(
+        await models.task_runs.create_task_run(
             session=session,
             task_run=schemas.core.TaskRun(
                 flow_run_id=flow_run.id, task_key="my-key-2", dynamic_key="0"
@@ -628,8 +666,8 @@ class TestReadTaskRuns:
         assert {result_1[0].id, result_2[0].id} == {task_run_1.id, task_run_2.id}
 
     async def test_read_task_runs_applies_sort(self, flow_run, session):
-        now = pendulum.now()
-        task_run_1 = await models.task_runs.create_task_run(
+        now = pendulum.now("UTC")
+        await models.task_runs.create_task_run(
             session=session,
             task_run=schemas.core.TaskRun(
                 flow_run_id=flow_run.id,
@@ -714,12 +752,12 @@ class TestPreventOrphanedConcurrencySlots:
     async def task_run_1(self, session, flow_run):
         model = await models.task_runs.create_task_run(
             session=session,
-            task_run=schemas.actions.TaskRunCreate(
+            task_run=schemas.core.TaskRun(
                 flow_run_id=flow_run.id,
                 task_key="my-key-1",
                 dynamic_key="0",
                 tags=["red"],
-                state=Pending().dict(shallow=True),
+                state=Pending(),
             ),
         )
         await session.commit()
@@ -729,12 +767,12 @@ class TestPreventOrphanedConcurrencySlots:
     async def task_run_2(self, session, flow_run):
         model = await models.task_runs.create_task_run(
             session=session,
-            task_run=schemas.actions.TaskRunCreate(
+            task_run=schemas.core.TaskRun(
                 flow_run_id=flow_run.id,
                 task_key="my-key-2",
                 dynamic_key="1",
                 tags=["red"],
-                state=Pending().dict(shallow=True),
+                state=Pending(),
             ),
         )
         await session.commit()

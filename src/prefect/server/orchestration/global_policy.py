@@ -4,7 +4,7 @@ Bookkeeping logic that fires on every state transition.
 For clarity, `GlobalFlowpolicy` and `GlobalTaskPolicy` contain all transition logic
 implemented using [`BaseUniversalTransform`][prefect.server.orchestration.rules.BaseUniversalTransform].
 None of these operations modify state, and regardless of what orchestration Prefect REST API might
-enforce on a transtition, the global policies contain Prefect's necessary bookkeeping.
+enforce on a transition, the global policies contain Prefect's necessary bookkeeping.
 Because these transforms record information about the validated state committed to the
 state database, they should be the most deeply nested contexts in orchestration loop.
 """
@@ -21,17 +21,19 @@ from prefect.server.orchestration.rules import (
 )
 from prefect.server.schemas.core import FlowRunPolicy
 
-COMMON_GLOBAL_TRANSFORMS = lambda: [
-    SetRunStateType,
-    SetRunStateName,
-    SetRunStateTimestamp,
-    SetStartTime,
-    SetEndTime,
-    IncrementRunTime,
-    SetExpectedStartTime,
-    SetNextScheduledStartTime,
-    UpdateStateDetails,
-]
+
+def COMMON_GLOBAL_TRANSFORMS():
+    return [
+        SetRunStateType,
+        SetRunStateName,
+        SetRunStateTimestamp,
+        SetStartTime,
+        SetEndTime,
+        IncrementRunTime,
+        SetExpectedStartTime,
+        SetNextScheduledStartTime,
+        UpdateStateDetails,
+    ]
 
 
 class GlobalFlowPolicy(BaseOrchestrationPolicy):
@@ -201,7 +203,7 @@ class RemoveResumingIndicator(BaseUniversalTransform):
         if api_version is None or api_version >= Version("0.8.4"):
             if proposed_state.is_running() or proposed_state.is_final():
                 if context.run.empirical_policy.resuming:
-                    updated_policy = context.run.empirical_policy.dict()
+                    updated_policy = context.run.empirical_policy.model_dump()
                     updated_policy["resuming"] = False
                     context.run.empirical_policy = FlowRunPolicy(**updated_policy)
 
@@ -279,17 +281,7 @@ class UpdateSubflowParentTask(BaseUniversalTransform):
         # only applies to flow runs with a parent task run id
         if context.run.parent_task_run_id is not None:
             # avoid mutation of the flow run state
-            subflow_parent_task_state = context.validated_state.copy(
-                reset_fields=True,
-                include={
-                    "type",
-                    "timestamp",
-                    "name",
-                    "message",
-                    "state_details",
-                    "data",
-                },
-            )
+            subflow_parent_task_state = context.validated_state.fresh_copy()
 
             # set the task's "child flow run id" to be the subflow run id
             subflow_parent_task_state.state_details.child_flow_run_id = context.run.id

@@ -3,6 +3,7 @@ import logging
 import sys
 import time
 import traceback
+import uuid
 import warnings
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Type, Union
@@ -14,15 +15,18 @@ from rich.theme import Theme
 from typing_extensions import Self
 
 import prefect.context
-from prefect._internal.compatibility.deprecated import deprecated_callable
+from prefect._internal.concurrency.api import create_call, from_sync
+from prefect._internal.concurrency.event_loop import get_running_loop
 from prefect._internal.concurrency.services import BatchedQueueService
+from prefect._internal.concurrency.threads import in_global_loop
 from prefect.client.orchestration import get_client
+from prefect.client.schemas.actions import LogCreate
 from prefect.exceptions import MissingContextError
 from prefect.logging.highlighters import PrefectConsoleHighlighter
-from prefect.server.schemas.actions import LogCreate
 from prefect.settings import (
     PREFECT_API_URL,
     PREFECT_LOGGING_COLORS,
+    PREFECT_LOGGING_INTERNAL_LEVEL,
     PREFECT_LOGGING_MARKUP,
     PREFECT_LOGGING_TO_API_BATCH_INTERVAL,
     PREFECT_LOGGING_TO_API_BATCH_SIZE,
@@ -48,11 +52,15 @@ class APILogWorker(BatchedQueueService[Dict[str, Any]]):
     async def _handle_batch(self, items: List):
         try:
             await self._client.create_logs(items)
-        except Exception:
+        except Exception as e:
             # Roughly replicate the behavior of the stdlib logger error handling
             if logging.raiseExceptions and sys.stderr:
                 sys.stderr.write("--- Error logging to API ---\n")
-                traceback.print_exc(file=sys.stderr)
+                if PREFECT_LOGGING_INTERNAL_LEVEL.value() == "DEBUG":
+                    traceback.print_exc(file=sys.stderr)
+                else:
+                    # Only log the exception message in non-DEBUG mode
+                    sys.stderr.write(str(e))
 
     @asynccontextmanager
     async def _lifespan(self):
@@ -88,9 +96,36 @@ class APILogHandler(logging.Handler):
         Tell the `APILogWorker` to send any currently enqueued logs and block until
         completion.
 
-        Returns an awaitable if called from an async context.
+        Use `aflush` from async contexts instead.
         """
-        return APILogWorker.drain_all()
+        loop = get_running_loop()
+        if loop:
+            if in_global_loop():  # Guard against internal misuse
+                raise RuntimeError(
+                    "Cannot call `APILogWorker.flush` from the global event loop; it"
+                    " would block the event loop and cause a deadlock. Use"
+                    " `APILogWorker.aflush` instead."
+                )
+
+            # Not ideal, but this method is called by the stdlib and cannot return a
+            # coroutine so we just schedule the drain in a new thread and continue
+            from_sync.call_soon_in_new_thread(create_call(APILogWorker.drain_all))
+            return None
+        else:
+            # We set a timeout of 5s because we don't want to block forever if the worker
+            # is stuck. This can occur when the handler is being shutdown and the
+            # `logging._lock` is held but the worker is attempting to emit logs resulting
+            # in a deadlock.
+            return APILogWorker.drain_all(timeout=5)
+
+    @classmethod
+    async def aflush(cls):
+        """
+        Tell the `APILogWorker` to send any currently enqueued logs and block until
+        completion.
+        """
+
+        return await APILogWorker.drain_all()
 
     def emit(self, record: logging.LogRecord):
         """
@@ -101,8 +136,10 @@ class APILogHandler(logging.Handler):
 
             if not PREFECT_LOGGING_TO_API_ENABLED.value_from(profile.settings):
                 return  # Respect the global settings toggle
-            if not getattr(record, "send_to_orion", True):
+            if not getattr(record, "send_to_api", True):
                 return  # Do not send records that have opted out
+            if not getattr(record, "send_to_orion", True):
+                return  # Backwards compatibility
 
             log = self.prepare(record)
             APILogWorker.instance().send(log)
@@ -168,8 +205,15 @@ class APILogHandler(logging.Handler):
         # Parsing to a `LogCreate` object here gives us nice parsing error messages
         # from the standard lib `handleError` method if something goes wrong and
         # prevents malformed logs from entering the queue
+        try:
+            is_uuid_like = isinstance(flow_run_id, uuid.UUID) or (
+                isinstance(flow_run_id, str) and uuid.UUID(flow_run_id)
+            )
+        except ValueError:
+            is_uuid_like = False
+
         log = LogCreate(
-            flow_run_id=flow_run_id,
+            flow_run_id=flow_run_id if is_uuid_like else None,
             task_run_id=task_run_id,
             name=record.name,
             level=record.levelno,
@@ -177,7 +221,7 @@ class APILogHandler(logging.Handler):
                 getattr(record, "created", None) or time.time()
             ),
             message=self.format(record),
-        ).dict(json_compatible=True)
+        ).model_dump(mode="json")
 
         log_size = log["__payload_size__"] = self._get_payload_size(log)
         if log_size > PREFECT_LOGGING_TO_API_MAX_LOG_SIZE.value():
@@ -190,9 +234,6 @@ class APILogHandler(logging.Handler):
 
     def _get_payload_size(self, log: Dict[str, Any]) -> int:
         return len(json.dumps(log).encode())
-
-    def close(self):
-        APILogWorker.drain_all()
 
 
 class PrefectConsoleHandler(logging.StreamHandler):
@@ -241,17 +282,3 @@ class PrefectConsoleHandler(logging.StreamHandler):
             raise
         except Exception:
             self.handleError(record)
-
-
-@deprecated_callable(start_date="Feb 2023", help="Use `APILogHandler` instead.")
-class OrionHandler(APILogHandler):
-    """
-    Deprecated. Use `APILogHandler` instead.
-    """
-
-
-@deprecated_callable(start_date="Feb 2023", help="Use `APILogWorker` instead.")
-class OrionLogWorker(APILogWorker):
-    """
-    Deprecated. Use `APILogWorker` instead.
-    """

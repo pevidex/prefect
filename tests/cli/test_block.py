@@ -3,15 +3,15 @@ import asyncio
 import pytest
 
 from prefect.blocks import system
-from prefect.client import PrefectClient
+from prefect.client.orchestration import PrefectClient
 from prefect.exceptions import ObjectNotFound
 from prefect.server import models
 from prefect.settings import (
-    PREFECT_API_BLOCKS_REGISTER_ON_START,
     PREFECT_UI_URL,
     temporary_settings,
 )
 from prefect.testing.cli import invoke_and_assert
+from prefect.utilities.asyncutils import run_sync_in_worker_thread
 
 TEST_BLOCK_CODE = """\
 from prefect.blocks.core import Block
@@ -83,7 +83,7 @@ def test_register_blocks_from_invalid_module():
     )
 
 
-def test_register_blocks_from_file(tmp_path, orion_client: PrefectClient):
+def test_register_blocks_from_file(tmp_path, prefect_client: PrefectClient):
     test_file_path = tmp_path / "test.py"
 
     with open(test_file_path, "w") as f:
@@ -100,7 +100,7 @@ def test_register_blocks_from_file(tmp_path, orion_client: PrefectClient):
         )
 
     block_type = asyncio.run(
-        orion_client.read_block_type_by_slug(slug="testforfileregister")
+        prefect_client.read_block_type_by_slug(slug="testforfileregister")
     )
     assert block_type is not None
 
@@ -127,8 +127,8 @@ def test_register_blocks_from_txt_file(tmp_path):
         ["block", "register", "-f", "test.txt"],
         expected_code=1,
         expected_output_contains=(
-            f"test.txt is not a .py file. Please specify a "
-            f".py that contains blocks to be registered."
+            "test.txt is not a .py file. Please specify a "
+            ".py that contains blocks to be registered."
         ),
     )
 
@@ -175,7 +175,7 @@ def test_register_fails_on_multiple_options():
 def test_listing_blocks_when_none_are_registered():
     invoke_and_assert(
         ["block", "ls"],
-        expected_output_contains=f"""                           
+        expected_output_contains="""
            ┏━━━━┳━━━━━━┳━━━━━━┳━━━━━━┓
            ┃ ID ┃ Type ┃ Name ┃ Slug ┃
            ┡━━━━╇━━━━━━╇━━━━━━╇━━━━━━┩
@@ -184,72 +184,86 @@ def test_listing_blocks_when_none_are_registered():
     )
 
 
-def test_listing_blocks_after_saving_a_block():
-    block_id = system.JSON(value="a casual test block").save("wildblock")
+async def test_listing_blocks_after_saving_a_block():
+    block_id = await system.JSON(value="a casual test block").save("wildblock")
 
-    invoke_and_assert(
-        ["block", "ls"],
-        expected_output_contains=f"""                           
+    await run_sync_in_worker_thread(
+        invoke_and_assert,
+        command=["block", "ls"],
+        expected_output_contains=f"""
             ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
             ┃ ID                                   ┃ Type ┃ Name      ┃ Slug           ┃
             ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
             │ {block_id} │ JSON │ wildblock │ json/wildblock │
-            └──────────────────────────────────────┴──────┴───────────┴────────────────┘  
+            └──────────────────────────────────────┴──────┴───────────┴────────────────┘
             """,
     )
 
 
-def test_listing_system_block_types():
-    with temporary_settings({PREFECT_API_BLOCKS_REGISTER_ON_START: True}):
-        expected_output = (
-            "Block Types",
-            "Slug",
-            "Description",
-            "slack",
-            "date-time",
-            "docker-container",
-            "gcs",
-            "json",
-            "kubernetes-cluster-config",
-            "kubernetes-job",
-            "local-file-system",
-            "process",
-            "remote-file-system",
-            "s3",
-            "secret",
-            "slack-webhook",
-        )
+def test_listing_system_block_types(register_block_types):
+    expected_output = (
+        "Block Types",
+        "Slug",
+        "Description",
+        "slack",
+        "date-time",
+        "json",
+        "local-file-system",
+        "remote-file-system",
+        "secret",
+        "slack-webhook",
+    )
 
-        invoke_and_assert(
-            ["block", "type", "ls"],
-            expected_code=0,
-            expected_output_contains=expected_output,
-        )
+    invoke_and_assert(
+        ["block", "type", "ls"],
+        expected_code=0,
+        expected_output_contains=expected_output,
+    )
 
 
-def test_inspecting_a_block():
-    system.JSON(value="a simple json blob").save("jsonblob")
+async def test_inspecting_a_block():
+    await system.JSON(value="a simple json blob").save("jsonblob")
 
     expected_output = ("Block Type", "Block id", "value", "a simple json blob")
 
-    invoke_and_assert(
+    await run_sync_in_worker_thread(
+        invoke_and_assert,
         ["block", "inspect", "json/jsonblob"],
         expected_code=0,
         expected_output_contains=expected_output,
     )
 
 
-def test_deleting_a_block():
-    system.JSON(value="don't delete me please").save("pleasedonterase")
-
+def test_inspecting_a_block_malformed_slug():
     invoke_and_assert(
+        ["block", "inspect", "chonk-block"],
+        expected_code=1,
+        expected_output_contains="'chonk-block' is not valid. Slug must contain a '/'",
+    )
+
+
+async def test_deleting_a_block():
+    await system.JSON(value="don't delete me please").save("pleasedonterase")
+
+    await run_sync_in_worker_thread(
+        invoke_and_assert,
         ["block", "delete", "json/pleasedonterase"],
+        user_input="y",
         expected_code=0,
     )
 
-    invoke_and_assert(
+    await run_sync_in_worker_thread(
+        invoke_and_assert,
         ["block", "inspect", "json/pleasedonterase"],
         expected_code=1,
+    )
+
+
+def test_deleting_a_block_malformed_slug():
+    invoke_and_assert(
+        ["block", "delete", "chonk-block"],
+        expected_code=1,
+        expected_output_contains="'chonk-block' is not valid. Slug must contain a '/'",
     )
 
 
@@ -271,6 +285,9 @@ def test_inspecting_a_block_type(tmp_path):
         "Description",
         "TestForFileRegister",
         "testforfileregister",
+        "Schema Properties",
+        "message",
+        "Message",
     ]
 
     invoke_and_assert(
@@ -280,7 +297,7 @@ def test_inspecting_a_block_type(tmp_path):
     )
 
 
-def test_deleting_a_block_type(tmp_path, orion_client):
+def test_deleting_a_block_type(tmp_path, prefect_client):
     test_file_path = tmp_path / "test.py"
 
     with open(test_file_path, "w") as f:
@@ -300,22 +317,22 @@ def test_deleting_a_block_type(tmp_path, orion_client):
     invoke_and_assert(
         ["block", "type", "delete", "testforfileregister"],
         expected_code=0,
+        user_input="y",
         expected_output_contains=expected_output,
     )
 
     with pytest.raises(ObjectNotFound):
-        block_type = asyncio.run(
-            orion_client.read_block_type_by_slug(slug="testforfileregister")
-        )
+        asyncio.run(prefect_client.read_block_type_by_slug(slug="testforfileregister"))
 
 
 def test_deleting_a_protected_block_type(
-    tmp_path, orion_client, install_system_block_types
+    tmp_path, prefect_client, install_system_block_types
 ):
     expected_output = "is a protected block"
 
     invoke_and_assert(
         ["block", "type", "delete", "json"],
         expected_code=1,
+        user_input="y",
         expected_output_contains=expected_output,
     )

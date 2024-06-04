@@ -2,20 +2,20 @@ import importlib.util
 import runpy
 import sys
 from pathlib import Path
+from textwrap import dedent
 from types import ModuleType
-from uuid import uuid4
 
 import pytest
 
 import prefect
 from prefect import __development_base_path__
-from prefect.docker import docker_client
 from prefect.exceptions import ScriptError
 from prefect.utilities.filesystem import tmpchdir
 from prefect.utilities.importtools import (
     from_qualified_name,
     import_object,
     lazy_import,
+    safe_load_namespace,
     to_qualified_name,
 )
 
@@ -32,26 +32,6 @@ class Foo:
 
 # Note we use the hosted API to avoid Postgres engine caching errors
 pytest.mark.usefixtures("hosted_orion")
-
-
-@pytest.fixture
-def reset_sys_modules():
-    original_modules = sys.modules.copy()
-
-    # Workaround for weird behavior on Linux where some of our "expected failure" tests
-    # succeed because '.' is in the path.
-    if sys.platform == "linux" and "." in sys.path:
-        sys.path.remove(".")
-
-    yield
-
-    # Delete all of the module objects that were introduced so they are not cached
-    for module in set(sys.modules.keys()):
-        if module not in original_modules:
-            del sys.modules[module]
-
-    importlib.invalidate_caches()
-    sys.modules = original_modules
 
 
 @pytest.mark.parametrize(
@@ -76,11 +56,11 @@ def test_to_and_from_qualified_name_roundtrip(obj):
 @pytest.fixture
 def pop_docker_module():
     # Allows testing of `lazy_import` on a clean sys
-    orginal = sys.modules.pop("docker")
+    original = sys.modules.pop("docker")
     try:
         yield
     finally:
-        sys.modules["docker"] = orginal
+        sys.modules["docker"] = original
 
 
 @pytest.mark.usefixtures("pop_docker_module")
@@ -91,21 +71,6 @@ def test_lazy_import():
     assert callable(docker.from_env)
 
 
-@pytest.mark.service("docker")
-def test_lazy_import_does_not_break_type_comparisons():
-    docker = lazy_import("docker")
-    docker.errors = lazy_import("docker.errors")
-
-    with docker_client() as client:
-        try:
-            client.containers.get(uuid4().hex)  # Better not exist
-        except docker.errors.NotFound:
-            pass
-
-    # The exception should not raise but can raise if `lazy_import` creates a duplicate
-    # copy of the `docker` module
-
-
 def test_lazy_import_fails_for_missing_modules():
     with pytest.raises(ModuleNotFoundError, match="flibbidy"):
         lazy_import("flibbidy", error_on_import=True)
@@ -114,11 +79,11 @@ def test_lazy_import_fails_for_missing_modules():
 def test_lazy_import_allows_deferred_failure_for_missing_module():
     module = lazy_import("flibbidy", error_on_import=False)
     assert isinstance(module, ModuleType)
-    with pytest.raises(ModuleNotFoundError, match=f"No module named 'flibbidy'") as exc:
+    with pytest.raises(ModuleNotFoundError, match="No module named 'flibbidy'") as exc:
         module.foo
     assert (
-        "module = lazy_import" in exc.exconly()
-    ), "Exception should contain original line in message"
+        "No module named 'flibbidy'" in exc.exconly()
+    ), "Exception should contain error message"
 
 
 def test_lazy_import_includes_help_message_for_missing_modules():
@@ -141,7 +106,6 @@ def test_lazy_import_includes_help_message_in_deferred_failure():
         module.foo
 
 
-@pytest.mark.usefixtures("reset_sys_modules")
 @pytest.mark.parametrize(
     "working_directory,script_path",
     [
@@ -177,10 +141,10 @@ def test_import_object_from_script_with_relative_imports(
     with tmpchdir(working_directory):
         foobar = import_object(f"{script_path}:foobar")
 
+    assert callable(foobar), f"Expected callable, got {foobar!r}"
     assert foobar() == "foobar"
 
 
-@pytest.mark.usefixtures("reset_sys_modules")
 @pytest.mark.parametrize(
     "working_directory,script_path",
     [
@@ -207,7 +171,6 @@ def test_import_object_from_script_with_relative_imports_expected_failures(
             runpy.run_path(str(script_path))
 
 
-@pytest.mark.usefixtures("reset_sys_modules")
 @pytest.mark.parametrize(
     "working_directory,import_path",
     [
@@ -225,8 +188,6 @@ def test_import_object_from_module_with_relative_imports(
         assert foobar() == "foobar"
 
 
-@pytest.mark.flaky(max_runs=3)
-@pytest.mark.usefixtures("reset_sys_modules")
 @pytest.mark.parametrize(
     "working_directory,import_path",
     [
@@ -248,3 +209,79 @@ def test_import_object_from_module_with_relative_imports_expected_failures(
         # Python would raise the same error
         with pytest.raises((ValueError, ImportError)):
             runpy.run_module(import_path)
+
+
+def test_safe_load_namespace():
+    source_code = dedent(
+        """
+        import math
+        from datetime import datetime
+        from pydantic import BaseModel
+                         
+        class MyModel(BaseModel):
+            x: int
+                         
+        def my_fn():
+            return 42
+
+        x = 10
+        y = math.sqrt(x)
+        now = datetime.now()
+    """
+    )
+
+    namespace = safe_load_namespace(source_code)
+
+    # module-level imports should be present
+    assert "math" in namespace
+    assert "datetime" in namespace
+    assert "BaseModel" in namespace
+    # module-level variables should not be present
+    assert "x" not in namespace
+    assert "y" not in namespace
+    assert "now" not in namespace
+    # module-level classes should be present
+    assert "MyModel" in namespace
+    # module-level functions should be present
+    assert "my_fn" in namespace
+
+    assert namespace["MyModel"].__name__ == "MyModel"
+
+
+def test_safe_load_namespace_ignores_import_errors():
+    source_code = dedent(
+        """
+        import flibbidy
+                         
+        from pydantic import BaseModel
+                         
+        class MyModel(BaseModel):
+            x: int
+    """
+    )
+
+    # should not raise an ImportError
+    namespace = safe_load_namespace(source_code)
+
+    assert "flibbidy" not in namespace
+    # other imports and classes should be present
+    assert "BaseModel" in namespace
+    assert "MyModel" in namespace
+    assert namespace["MyModel"].__name__ == "MyModel"
+
+
+def test_safe_load_namespace_ignore_class_declaration_errors():
+    source_code = dedent(
+        """
+        from fake_pandas import DataFrame
+                         
+        class CoolDataFrame(DataFrame):
+            pass
+    """
+    )
+
+    # should not raise any errors
+    namespace = safe_load_namespace(source_code)
+
+    assert "DataFrame" not in namespace
+    assert "CoolDataFrame" not in namespace

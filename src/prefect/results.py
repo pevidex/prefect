@@ -4,7 +4,9 @@ from functools import partial
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     Callable,
+    Dict,
     Generic,
     Optional,
     Tuple,
@@ -12,25 +14,33 @@ from typing import (
     TypeVar,
     Union,
 )
+from uuid import UUID
 
-import pydantic
-from typing_extensions import Self
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
+from pydantic_core import PydanticUndefinedType
+from typing_extensions import ParamSpec, Self
 
 import prefect
 from prefect.blocks.core import Block
 from prefect.client.utilities import inject_client
-from prefect.exceptions import MissingContextError, MissingResult
-from prefect.filesystems import LocalFileSystem, ReadableFileSystem, WritableFileSystem
+from prefect.exceptions import MissingResult, ObjectAlreadyExists
+from prefect.filesystems import (
+    LocalFileSystem,
+    ReadableFileSystem,
+    WritableFileSystem,
+)
 from prefect.logging import get_logger
 from prefect.serializers import Serializer
 from prefect.settings import (
+    PREFECT_DEFAULT_RESULT_STORAGE_BLOCK,
     PREFECT_LOCAL_STORAGE_PATH,
     PREFECT_RESULTS_DEFAULT_SERIALIZER,
     PREFECT_RESULTS_PERSIST_BY_DEFAULT,
+    PREFECT_TASK_SCHEDULING_DEFAULT_STORAGE_BLOCK,
 )
 from prefect.utilities.annotations import NotSet
 from prefect.utilities.asyncutils import sync_compatible
-from prefect.utilities.pydantic import add_type_dispatch
+from prefect.utilities.pydantic import get_dispatch_key, lookup_type, register_base_type
 
 if TYPE_CHECKING:
     from prefect import Flow, Task
@@ -39,20 +49,76 @@ if TYPE_CHECKING:
 
 ResultStorage = Union[WritableFileSystem, str]
 ResultSerializer = Union[Serializer, str]
-LITERAL_TYPES = {type(None), bool}
-DEFAULT_STORAGE_KEY_FN = lambda: uuid.uuid4().hex
+LITERAL_TYPES = {type(None), bool, UUID}
+
+
+def DEFAULT_STORAGE_KEY_FN():
+    return uuid.uuid4().hex
+
 
 logger = get_logger("results")
-
-# from prefect.server.schemas.states import State
+P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def get_default_result_storage() -> ResultStorage:
+@sync_compatible
+async def get_default_result_storage() -> ResultStorage:
     """
     Generate a default file system for result storage.
     """
-    return LocalFileSystem(basepath=PREFECT_LOCAL_STORAGE_PATH.value())
+    return (
+        await Block.load(PREFECT_DEFAULT_RESULT_STORAGE_BLOCK.value())
+        if PREFECT_DEFAULT_RESULT_STORAGE_BLOCK.value() is not None
+        else LocalFileSystem(basepath=PREFECT_LOCAL_STORAGE_PATH.value())
+    )
+
+
+_default_task_scheduling_storages: Dict[Tuple[str, str], WritableFileSystem] = {}
+
+
+async def get_or_create_default_task_scheduling_storage() -> ResultStorage:
+    """
+    Generate a default file system for background task parameter/result storage.
+    """
+    default_storage_name, storage_path = cache_key = (
+        PREFECT_TASK_SCHEDULING_DEFAULT_STORAGE_BLOCK.value(),
+        PREFECT_LOCAL_STORAGE_PATH.value(),
+    )
+
+    async def get_storage() -> WritableFileSystem:
+        try:
+            return await Block.load(default_storage_name)
+        except ValueError as e:
+            if "Unable to find" not in str(e):
+                raise e
+
+        block_type_slug, name = default_storage_name.split("/")
+        if block_type_slug == "local-file-system":
+            block = LocalFileSystem(basepath=storage_path)
+        else:
+            raise Exception(
+                "The default task storage block does not exist, but it is of type "
+                f"'{block_type_slug}' which cannot be created implicitly.  Please create "
+                "the block manually."
+            )
+
+        try:
+            await block.save(name, overwrite=False)
+        except ValueError as e:
+            if "already in use" not in str(e):
+                raise e
+        except ObjectAlreadyExists:
+            # Another client created the block before we reached this line
+            block = await Block.load(default_storage_name)
+
+        return block
+
+    try:
+        return _default_task_scheduling_storages[cache_key]
+    except KeyError:
+        storage = await get_storage()
+        _default_task_scheduling_storages[cache_key] = storage
+        return storage
 
 
 def get_default_result_serializer() -> ResultSerializer:
@@ -84,7 +150,7 @@ def flow_features_require_child_result_persistence(flow: "Flow") -> bool:
     Returns `True` if the given flow uses features that require child flow and task
     runs to persist their results.
     """
-    if flow.retries:
+    if flow and flow.retries:
         return True
     return False
 
@@ -101,14 +167,14 @@ def task_features_require_result_persistence(task: "Task") -> bool:
     return False
 
 
-def _format_user_supplied_storage_key(key):
+def _format_user_supplied_storage_key(key: str) -> str:
     # Note here we are pinning to task runs since flow runs do not support storage keys
     # yet; we'll need to split logic in the future or have two separate functions
     runtime_vars = {key: getattr(prefect.runtime, key) for key in dir(prefect.runtime)}
     return key.format(**runtime_vars, parameters=prefect.runtime.task_run.parameters)
 
 
-class ResultFactory(pydantic.BaseModel):
+class ResultFactory(BaseModel):
     """
     A utility to generate `Result` types.
     """
@@ -116,7 +182,7 @@ class ResultFactory(pydantic.BaseModel):
     persist_result: bool
     cache_result_in_memory: bool
     serializer: Serializer
-    storage_block_id: uuid.UUID
+    storage_block_id: Optional[uuid.UUID] = None
     storage_block: WritableFileSystem
     storage_key_fn: Callable[[], str]
 
@@ -135,7 +201,7 @@ class ResultFactory(pydantic.BaseModel):
                 kwargs.pop(key)
 
         # Apply defaults
-        kwargs.setdefault("result_storage", get_default_result_storage())
+        kwargs.setdefault("result_storage", await get_default_result_storage())
         kwargs.setdefault("result_serializer", get_default_result_serializer())
         kwargs.setdefault("persist_result", get_default_persist_setting())
         kwargs.setdefault("cache_result_in_memory", True)
@@ -163,10 +229,9 @@ class ResultFactory(pydantic.BaseModel):
                 persist_result=(
                     flow.persist_result
                     if flow.persist_result is not None
-                    else
                     # !! Child flows persist their result by default if the it or the
                     #    parent flow uses a feature that requires it
-                    (
+                    else (
                         flow_features_require_result_persistence(flow)
                         or flow_features_require_child_result_persistence(ctx.flow)
                         or get_default_persist_setting()
@@ -187,10 +252,9 @@ class ResultFactory(pydantic.BaseModel):
                 persist_result=(
                     flow.persist_result
                     if flow.persist_result is not None
-                    else
                     # !! Flows persist their result by default if uses a feature that
                     #    requires it
-                    (
+                    else (
                         flow_features_require_result_persistence(flow)
                         or get_default_persist_setting()
                     )
@@ -210,25 +274,62 @@ class ResultFactory(pydantic.BaseModel):
         from prefect.context import FlowRunContext
 
         ctx = FlowRunContext.get()
-        if not ctx:
-            raise MissingContextError(
-                "A flow run context is required to create a result factory for a task."
-            )
 
-        result_storage = task.result_storage or ctx.result_factory.storage_block
-        result_serializer = task.result_serializer or ctx.result_factory.serializer
+        if ctx and ctx.autonomous_task_run:
+            return await cls.from_autonomous_task(task, client=client)
+
+        return await cls._from_task(task, get_default_result_storage, client=client)
+
+    @classmethod
+    @inject_client
+    async def from_autonomous_task(
+        cls: Type[Self], task: "Task[P, R]", client: "PrefectClient" = None
+    ) -> Self:
+        """
+        Create a new result factory for an autonomous task.
+        """
+        return await cls._from_task(
+            task, get_or_create_default_task_scheduling_storage, client=client
+        )
+
+    @classmethod
+    @inject_client
+    async def _from_task(
+        cls: Type[Self],
+        task: "Task",
+        default_storage_getter: Callable[[], Awaitable[ResultStorage]],
+        client: "PrefectClient" = None,
+    ) -> Self:
+        from prefect.context import FlowRunContext
+
+        ctx = FlowRunContext.get()
+
+        result_storage = task.result_storage or (
+            ctx.result_factory.storage_block
+            if ctx and ctx.result_factory
+            else await default_storage_getter()
+        )
+        result_serializer = task.result_serializer or (
+            ctx.result_factory.serializer
+            if ctx and ctx.result_factory
+            else get_default_result_serializer()
+        )
         persist_result = (
             task.persist_result
             if task.persist_result is not None
-            else
             # !! Tasks persist their result by default if their parent flow uses a
             #    feature that requires it or the task uses a feature that requires it
-            (
-                flow_features_require_child_result_persistence(ctx.flow)
+            else (
+                (
+                    flow_features_require_child_result_persistence(ctx.flow)
+                    if ctx
+                    else False
+                )
                 or task_features_require_result_persistence(task)
                 or get_default_persist_setting()
             )
         )
+
         cache_result_in_memory = task.cache_result_in_memory
 
         return await cls.from_settings(
@@ -256,7 +357,7 @@ class ResultFactory(pydantic.BaseModel):
         client: "PrefectClient",
     ) -> Self:
         storage_block_id, storage_block = await cls.resolve_storage_block(
-            result_storage, client=client
+            result_storage, client=client, persist_result=persist_result
         )
         serializer = cls.resolve_serializer(result_serializer)
 
@@ -271,23 +372,31 @@ class ResultFactory(pydantic.BaseModel):
 
     @staticmethod
     async def resolve_storage_block(
-        result_storage: ResultStorage, client: "PrefectClient"
-    ) -> Tuple[uuid.UUID, WritableFileSystem]:
+        result_storage: ResultStorage,
+        client: "PrefectClient",
+        persist_result: bool = True,
+    ) -> Tuple[Optional[uuid.UUID], WritableFileSystem]:
         """
         Resolve one of the valid `ResultStorage` input types into a saved block
         document id and an instance of the block.
         """
         if isinstance(result_storage, Block):
             storage_block = result_storage
-            storage_block_id = (
+
+            if storage_block._block_document_id is not None:
                 # Avoid saving the block if it already has an identifier assigned
-                storage_block._block_document_id
-                # TODO: Overwrite is true to avoid issues where the save collides with
-                #       a previously saved document with a matching hash
-                or await storage_block._save(
-                    is_anonymous=True, overwrite=True, client=client
-                )
-            )
+                storage_block_id = storage_block._block_document_id
+            else:
+                if persist_result:
+                    # TODO: Overwrite is true to avoid issues where the save collides with
+                    # a previously saved document with a matching hash
+                    storage_block_id = await storage_block._save(
+                        is_anonymous=True, overwrite=True, client=client
+                    )
+                else:
+                    # a None-type UUID on unpersisted storage should not matter
+                    # since the ID is generated on the server
+                    storage_block_id = None
         elif isinstance(result_storage, str):
             storage_block = await Block.load(result_storage, client=client)
             storage_block_id = storage_block._block_document_id
@@ -317,7 +426,7 @@ class ResultFactory(pydantic.BaseModel):
             )
 
     @sync_compatible
-    async def create_result(self, obj: R) -> Union[R, "BaseResult[R]"]:
+    async def create_result(self, obj: R, key: str = None) -> Union[R, "BaseResult[R]"]:
         """
         Create a result type for the given object.
 
@@ -337,23 +446,70 @@ class ResultFactory(pydantic.BaseModel):
         if type(obj) in LITERAL_TYPES:
             return await LiteralResult.create(obj)
 
+        if key:
+
+            def key_fn():
+                return key
+
+            storage_key_fn = key_fn
+        else:
+            storage_key_fn = self.storage_key_fn
+
         return await PersistedResult.create(
             obj,
             storage_block=self.storage_block,
             storage_block_id=self.storage_block_id,
-            storage_key_fn=self.storage_key_fn,
+            storage_key_fn=storage_key_fn,
             serializer=self.serializer,
             cache_object=should_cache_object,
         )
 
+    @sync_compatible
+    async def store_parameters(self, identifier: UUID, parameters: Dict[str, Any]):
+        assert (
+            self.storage_block_id is not None
+        ), "Unexpected storage block ID. Was it persisted?"
+        data = self.serializer.dumps(parameters)
+        blob = PersistedResultBlob(serializer=self.serializer, data=data)
+        await self.storage_block.write_path(
+            f"parameters/{identifier}", content=blob.to_bytes()
+        )
 
-@add_type_dispatch
-class BaseResult(pydantic.BaseModel, abc.ABC, Generic[R]):
+    @sync_compatible
+    async def read_parameters(self, identifier: UUID) -> Dict[str, Any]:
+        assert (
+            self.storage_block_id is not None
+        ), "Unexpected storage block ID. Was it persisted?"
+        blob = PersistedResultBlob.model_validate_json(
+            await self.storage_block.read_path(f"parameters/{identifier}")
+        )
+        return self.serializer.loads(blob.data)
+
+
+@register_base_type
+class BaseResult(BaseModel, abc.ABC, Generic[R]):
+    model_config = ConfigDict(extra="forbid")
+
     type: str
-    artifact_type: Optional[str]
-    artifact_description: Optional[str]
+    artifact_type: Optional[str] = None
+    artifact_description: Optional[str] = None
 
-    _cache: Any = pydantic.PrivateAttr(NotSet)
+    def __init__(self, **data: Any) -> None:
+        type_string = get_dispatch_key(self) if type(self) != BaseResult else "__base__"
+        data.setdefault("type", type_string)
+        super().__init__(**data)
+
+    def __new__(cls: Type[Self], **kwargs) -> Self:
+        if "type" in kwargs:
+            try:
+                subcls = lookup_type(cls, dispatch_key=kwargs["type"])
+            except KeyError as exc:
+                raise ValidationError(errors=[exc], model=cls)
+            return super().__new__(subcls)
+        else:
+            return super().__new__(cls)
+
+    _cache: Any = PrivateAttr(NotSet)
 
     def _cache_object(self, obj: Any) -> None:
         self._cache = obj
@@ -375,8 +531,10 @@ class BaseResult(pydantic.BaseModel, abc.ABC, Generic[R]):
     ) -> "BaseResult[R]":
         ...
 
-    class Config:
-        extra = "forbid"
+    @classmethod
+    def __dispatch_key__(cls, **kwargs):
+        default = cls.model_fields.get("type").get_default()
+        return cls.__name__ if isinstance(default, PydanticUndefinedType) else default
 
 
 class UnpersistedResult(BaseResult):
@@ -384,7 +542,7 @@ class UnpersistedResult(BaseResult):
     Result type for results that are not persisted outside of local memory.
     """
 
-    type = "unpersisted"
+    type: str = "unpersisted"
 
     @sync_compatible
     async def get(self) -> R:
@@ -419,8 +577,8 @@ class LiteralResult(BaseResult):
     They are not persisted to external result storage.
     """
 
-    type = "literal"
-    value: Any
+    type: str = "literal"
+    value: Any = None
 
     def has_cached_object(self) -> bool:
         # This result type always has the object cached in memory
@@ -456,13 +614,13 @@ class PersistedResult(BaseResult):
     content was written.
     """
 
-    type = "reference"
+    type: str = "reference"
 
     serializer_type: str
     storage_block_id: uuid.UUID
     storage_key: str
 
-    _should_cache_object: bool = pydantic.PrivateAttr(default=True)
+    _should_cache_object: bool = PrivateAttr(default=True)
 
     @sync_compatible
     @inject_client
@@ -484,10 +642,13 @@ class PersistedResult(BaseResult):
 
     @inject_client
     async def _read_blob(self, client: "PrefectClient") -> "PersistedResultBlob":
+        assert (
+            self.storage_block_id is not None
+        ), "Unexpected storage block ID. Was it persisted?"
         block_document = await client.read_block_document(self.storage_block_id)
         storage_block: ReadableFileSystem = Block._from_block_document(block_document)
         content = await storage_block.read_path(self.storage_key)
-        blob = PersistedResultBlob.parse_raw(content)
+        blob = PersistedResultBlob.model_validate_json(content)
         return blob
 
     @staticmethod
@@ -519,6 +680,9 @@ class PersistedResult(BaseResult):
         The object will be serialized and written to the storage block under a unique
         key. It will then be cached on the returned result.
         """
+        assert (
+            storage_block_id is not None
+        ), "Unexpected storage block ID. Was it persisted?"
         data = serializer.dumps(obj)
         blob = PersistedResultBlob(serializer=serializer, data=data)
 
@@ -527,7 +691,6 @@ class PersistedResult(BaseResult):
             raise TypeError(
                 f"Expected type 'str' for result storage key; got value {key!r}"
             )
-
         await storage_block.write_path(key, content=blob.to_bytes())
 
         description = f"Result of type `{type(obj).__name__}`"
@@ -557,7 +720,7 @@ class PersistedResult(BaseResult):
         return result
 
 
-class PersistedResultBlob(pydantic.BaseModel):
+class PersistedResultBlob(BaseModel):
     """
     The format of the content stored by a persisted result.
 
@@ -566,7 +729,45 @@ class PersistedResultBlob(pydantic.BaseModel):
 
     serializer: Serializer
     data: bytes
-    prefect_version: str = pydantic.Field(default=prefect.__version__)
+    prefect_version: str = Field(default=prefect.__version__)
 
     def to_bytes(self) -> bytes:
-        return self.json().encode()
+        return self.model_dump_json(serialize_as_any=True).encode()
+
+
+class UnknownResult(BaseResult):
+    """
+    Result type for unknown results. Typically used to represent the result
+    of tasks that were forced from a failure state into a completed state.
+
+    The value for this result is always None and is not persisted to external
+    result storage, but orchestration treats the result the same as persisted
+    results when determining orchestration rules, such as whether to rerun a
+    completed task.
+    """
+
+    type: str = "unknown"
+    value: None
+
+    def has_cached_object(self) -> bool:
+        # This result type always has the object cached in memory
+        return True
+
+    @sync_compatible
+    async def get(self) -> R:
+        return self.value
+
+    @classmethod
+    @sync_compatible
+    async def create(
+        cls: "Type[UnknownResult]",
+        obj: R = None,
+    ) -> "UnknownResult[R]":
+        if obj is not None:
+            raise TypeError(
+                f"Unsupported type {type(obj).__name__!r} for unknown result. "
+                "Only None is supported."
+            )
+
+        description = "Unknown result persisted to Prefect."
+        return cls(value=obj, artifact_type="result", artifact_description=description)

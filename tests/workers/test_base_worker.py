@@ -1,19 +1,20 @@
 import uuid
-from typing import Optional
-from unittest.mock import call
+from typing import Any, Dict, Optional, Type
+from unittest.mock import ANY, MagicMock, call
 
 import anyio
 import pendulum
-import pydantic
 import pytest
+from packaging import version
 from pydantic import Field
 
 import prefect
-import prefect.server.schemas as schemas
+import prefect.client.schemas as schemas
 from prefect.blocks.core import Block
 from prefect.client.orchestration import PrefectClient, get_client
 from prefect.client.schemas import FlowRun
 from prefect.exceptions import (
+    CrashedRun,
     InfrastructureNotAvailable,
     InfrastructureNotFound,
     ObjectNotFound,
@@ -23,21 +24,31 @@ from prefect.server import models
 from prefect.server.schemas.core import Flow
 from prefect.server.schemas.responses import DeploymentResponse
 from prefect.server.schemas.states import StateType
-from prefect.settings import PREFECT_WORKER_PREFETCH_SECONDS, get_current_settings
+from prefect.settings import (
+    PREFECT_EXPERIMENTAL_ENABLE_ENHANCED_CANCELLATION,
+    PREFECT_EXPERIMENTAL_WARN_ENHANCED_CANCELLATION,
+    PREFECT_WORKER_PREFETCH_SECONDS,
+    get_current_settings,
+    temporary_settings,
+)
 from prefect.states import Cancelled, Cancelling, Completed, Pending, Running, Scheduled
 from prefect.testing.utilities import AsyncMock
+from prefect.utilities.pydantic import parse_obj_as
 from prefect.workers.base import BaseJobConfiguration, BaseVariables, BaseWorker
 
 
 class WorkerTestImpl(BaseWorker):
-    type = "test"
-    job_configuration = BaseJobConfiguration
+    type: str = "test"
+    job_configuration: Type[BaseJobConfiguration] = BaseJobConfiguration
 
     async def run(self):
         pass
 
     async def kill_infrastructure(
-        self, infrastructure_pid: str, grace_seconds: int = 30
+        self,
+        infrastructure_pid: str,
+        grace_seconds: int = 30,
+        configuration: Optional[BaseJobConfiguration] = None,
     ):
         pass
 
@@ -60,11 +71,32 @@ async def ensure_default_agent_pool_exists(session):
         await session.commit()
 
 
+@pytest.fixture
+async def variables(prefect_client: PrefectClient):
+    await prefect_client._client.post(
+        "/variables/", json={"name": "test_variable_1", "value": "test_value_1"}
+    )
+    await prefect_client._client.post(
+        "/variables/", json={"name": "test_variable_2", "value": "test_value_2"}
+    )
+
+
+@pytest.fixture
+def enable_enhanced_cancellation():
+    with temporary_settings(
+        updates={
+            PREFECT_EXPERIMENTAL_ENABLE_ENHANCED_CANCELLATION: True,
+            PREFECT_EXPERIMENTAL_WARN_ENHANCED_CANCELLATION: False,
+        }
+    ):
+        yield
+
+
 async def test_worker_creates_work_pool_by_default_during_sync(
-    orion_client: PrefectClient,
+    prefect_client: PrefectClient,
 ):
     with pytest.raises(ObjectNotFound):
-        await orion_client.read_work_pool("test-work-pool")
+        await prefect_client.read_work_pool("test-work-pool")
 
     async with WorkerTestImpl(
         name="test",
@@ -74,15 +106,15 @@ async def test_worker_creates_work_pool_by_default_during_sync(
         worker_status = worker.get_status()
         assert worker_status["work_pool"]["name"] == "test-work-pool"
 
-        work_pool = await orion_client.read_work_pool("test-work-pool")
+        work_pool = await prefect_client.read_work_pool("test-work-pool")
         assert str(work_pool.id) == worker_status["work_pool"]["id"]
 
 
 async def test_worker_does_not_creates_work_pool_when_create_pool_is_false(
-    orion_client: PrefectClient,
+    prefect_client: PrefectClient,
 ):
     with pytest.raises(ObjectNotFound):
-        await orion_client.read_work_pool("test-work-pool")
+        await prefect_client.read_work_pool("test-work-pool")
 
     async with WorkerTestImpl(
         name="test", work_pool_name="test-work-pool", create_pool_if_not_found=False
@@ -92,7 +124,7 @@ async def test_worker_does_not_creates_work_pool_when_create_pool_is_false(
         assert worker_status["work_pool"] is None
 
     with pytest.raises(ObjectNotFound):
-        await orion_client.read_work_pool("test-work-pool")
+        await prefect_client.read_work_pool("test-work-pool")
 
 
 @pytest.mark.parametrize(
@@ -111,12 +143,12 @@ async def test_worker_respects_settings(setting, attr):
 
 
 async def test_worker_sends_heartbeat_messages(
-    orion_client: PrefectClient,
+    prefect_client: PrefectClient,
 ):
     async with WorkerTestImpl(name="test", work_pool_name="test-work-pool") as worker:
         await worker.sync_with_backend()
 
-        workers = await orion_client.read_workers_for_work_pool(
+        workers = await prefect_client.read_workers_for_work_pool(
             work_pool_name="test-work-pool"
         )
         assert len(workers) == 1
@@ -125,7 +157,7 @@ async def test_worker_sends_heartbeat_messages(
 
         await worker.sync_with_backend()
 
-        workers = await orion_client.read_workers_for_work_pool(
+        workers = await prefect_client.read_workers_for_work_pool(
             work_pool_name="test-work-pool"
         )
         second_heartbeat = workers[0].last_heartbeat_time
@@ -133,17 +165,17 @@ async def test_worker_sends_heartbeat_messages(
 
 
 async def test_worker_with_work_pool(
-    orion_client: PrefectClient, worker_deployment_wq1, work_pool
+    prefect_client: PrefectClient, worker_deployment_wq1, work_pool
 ):
     @flow
     def test_flow():
         pass
 
-    create_run_with_deployment = (
-        lambda state: orion_client.create_flow_run_from_deployment(
+    def create_run_with_deployment(state):
+        return prefect_client.create_flow_run_from_deployment(
             worker_deployment_wq1.id, state=state
         )
-    )
+
     flow_runs = [
         await create_run_with_deployment(Pending()),
         await create_run_with_deployment(
@@ -160,7 +192,7 @@ async def test_worker_with_work_pool(
         ),
         await create_run_with_deployment(Running()),
         await create_run_with_deployment(Completed()),
-        await orion_client.create_flow_run(test_flow, state=Scheduled()),
+        await prefect_client.create_flow_run(test_flow, state=Scheduled()),
     ]
     flow_run_ids = [run.id for run in flow_runs]
 
@@ -173,7 +205,7 @@ async def test_worker_with_work_pool(
 
 
 async def test_worker_with_work_pool_and_work_queue(
-    orion_client: PrefectClient,
+    prefect_client: PrefectClient,
     worker_deployment_wq1,
     worker_deployment_wq_2,
     work_queue_1,
@@ -183,16 +215,16 @@ async def test_worker_with_work_pool_and_work_queue(
     def test_flow():
         pass
 
-    create_run_with_deployment_1 = (
-        lambda state: orion_client.create_flow_run_from_deployment(
+    def create_run_with_deployment_1(state):
+        return prefect_client.create_flow_run_from_deployment(
             worker_deployment_wq1.id, state=state
         )
-    )
-    create_run_with_deployment_2 = (
-        lambda state: orion_client.create_flow_run_from_deployment(
+
+    def create_run_with_deployment_2(state):
+        return prefect_client.create_flow_run_from_deployment(
             worker_deployment_wq_2.id, state=state
         )
-    )
+
     flow_runs = [
         await create_run_with_deployment_1(Pending()),
         await create_run_with_deployment_1(
@@ -209,7 +241,7 @@ async def test_worker_with_work_pool_and_work_queue(
         ),
         await create_run_with_deployment_1(Running()),
         await create_run_with_deployment_1(Completed()),
-        await orion_client.create_flow_run(test_flow, state=Scheduled()),
+        await prefect_client.create_flow_run(test_flow, state=Scheduled()),
     ]
     flow_run_ids = [run.id for run in flow_runs]
 
@@ -222,17 +254,17 @@ async def test_worker_with_work_pool_and_work_queue(
 
 
 async def test_worker_with_work_pool_and_limit(
-    orion_client: PrefectClient, worker_deployment_wq1, work_pool
+    prefect_client: PrefectClient, worker_deployment_wq1, work_pool
 ):
     @flow
     def test_flow():
         pass
 
-    create_run_with_deployment = (
-        lambda state: orion_client.create_flow_run_from_deployment(
+    def create_run_with_deployment(state):
+        return prefect_client.create_flow_run_from_deployment(
             worker_deployment_wq1.id, state=state
         )
-    )
+
     flow_runs = [
         await create_run_with_deployment(Pending()),
         await create_run_with_deployment(
@@ -249,7 +281,7 @@ async def test_worker_with_work_pool_and_limit(
         ),
         await create_run_with_deployment(Running()),
         await create_run_with_deployment(Completed()),
-        await orion_client.create_flow_run(test_flow, state=Scheduled()),
+        await prefect_client.create_flow_run(test_flow, state=Scheduled()),
     ]
     flow_run_ids = [run.id for run in flow_runs]
 
@@ -275,7 +307,7 @@ async def test_worker_with_work_pool_and_limit(
 
 
 async def test_worker_calls_run_with_expected_arguments(
-    orion_client: PrefectClient, worker_deployment_wq1, work_pool, monkeypatch
+    prefect_client: PrefectClient, worker_deployment_wq1, work_pool, monkeypatch
 ):
     run_mock = AsyncMock()
 
@@ -283,11 +315,11 @@ async def test_worker_calls_run_with_expected_arguments(
     def test_flow():
         pass
 
-    create_run_with_deployment = (
-        lambda state: orion_client.create_flow_run_from_deployment(
+    def create_run_with_deployment(state):
+        return prefect_client.create_flow_run_from_deployment(
             worker_deployment_wq1.id, state=state
         )
-    )
+
     flow_runs = [
         await create_run_with_deployment(Pending()),
         await create_run_with_deployment(
@@ -304,7 +336,7 @@ async def test_worker_calls_run_with_expected_arguments(
         ),
         await create_run_with_deployment(Running()),
         await create_run_with_deployment(Completed()),
-        await orion_client.create_flow_run(test_flow, state=Scheduled()),
+        await prefect_client.create_flow_run(test_flow, state=Scheduled()),
     ]
 
     async with WorkerTestImpl(work_pool_name=work_pool.name) as worker:
@@ -319,17 +351,16 @@ async def test_worker_calls_run_with_expected_arguments(
 
 
 async def test_worker_warns_when_running_a_flow_run_with_a_storage_block(
-    orion_client: PrefectClient, deployment, work_pool, caplog
+    prefect_client: PrefectClient, deployment, work_pool, caplog
 ):
     @flow
     def test_flow():
         pass
 
-    create_run_with_deployment = (
-        lambda state: orion_client.create_flow_run_from_deployment(
+    def create_run_with_deployment(state):
+        return prefect_client.create_flow_run_from_deployment(
             deployment.id, state=state
         )
-    )
 
     flow_run = await create_run_with_deployment(
         Scheduled(scheduled_time=pendulum.now("utc").add(seconds=5))
@@ -341,14 +372,57 @@ async def test_worker_warns_when_running_a_flow_run_with_a_storage_block(
 
     assert (
         f"Flow run {flow_run.id!r} was created from deployment"
-        f" {deployment.name!r} which is configured with a storage block. Workers"
-        " currently only support local storage. Please use an agent to execute this"
-        " flow run."
+        f" {deployment.name!r} which is configured with a storage block. Please use an"
+        + " agent to execute this flow run."
         in caplog.text
     )
 
-    flow_run = await orion_client.read_flow_run(flow_run.id)
+    flow_run = await prefect_client.read_flow_run(flow_run.id)
     assert flow_run.state_name == "Scheduled"
+
+
+async def test_worker_creates_only_one_client_context(
+    prefect_client, worker_deployment_wq1, work_pool, monkeypatch, caplog
+):
+    tracking_mock = MagicMock()
+    orig_get_client = get_client
+
+    def get_client_spy(*args, **kwargs):
+        tracking_mock(*args, **kwargs)
+        return orig_get_client(*args, **kwargs)
+
+    monkeypatch.setattr("prefect.workers.base.get_client", get_client_spy)
+
+    run_mock = AsyncMock()
+
+    @flow
+    def test_flow():
+        pass
+
+    def create_run_with_deployment(state):
+        return prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id, state=state
+        )
+
+    await create_run_with_deployment(
+        Scheduled(scheduled_time=pendulum.now("utc").subtract(days=1))
+    )
+    await create_run_with_deployment(
+        Scheduled(scheduled_time=pendulum.now("utc").add(seconds=5))
+    )
+    await create_run_with_deployment(
+        Scheduled(scheduled_time=pendulum.now("utc").add(seconds=5))
+    )
+
+    async with WorkerTestImpl(work_pool_name=work_pool.name) as worker:
+        worker._work_pool = work_pool
+        worker.run = run_mock  # don't run anything
+        await worker.get_and_submit_flow_runs()
+
+    assert tracking_mock.call_count == 1
+
+    # Multiple hits if worker's client is not being reused
+    assert caplog.text.count("Using ephemeral application") == 1
 
 
 async def test_base_worker_gets_job_configuration_when_syncing_with_backend_with_just_job_config(
@@ -358,7 +432,9 @@ async def test_base_worker_gets_job_configuration_when_syncing_with_backend_with
     with a correct base_job_template when creating a new work pool"""
 
     class WorkerJobConfig(BaseJobConfiguration):
-        other: Optional[str] = Field(template="{{other}}")
+        other: Optional[str] = Field(
+            default=None, json_schema_extra={"template": "{{ other }}"}
+        )
 
     # Add a job configuration for the worker (currently used to create template
     # if not found on the worker pool)
@@ -375,7 +451,8 @@ async def test_base_worker_gets_job_configuration_when_syncing_with_backend_with
         "variables": {
             "properties": {
                 "command": {
-                    "type": "string",
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": None,
                     "title": "Command",
                     "description": (
                         "The command to use when starting a flow run. "
@@ -386,7 +463,9 @@ async def test_base_worker_gets_job_configuration_when_syncing_with_backend_with
                 "env": {
                     "title": "Environment Variables",
                     "type": "object",
-                    "additionalProperties": {"type": "string"},
+                    "additionalProperties": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}]
+                    },
                     "description": (
                         "Environment variables to set when starting a flow run."
                     ),
@@ -401,14 +480,19 @@ async def test_base_worker_gets_job_configuration_when_syncing_with_backend_with
                     ),
                 },
                 "name": {
-                    "type": "string",
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": None,
                     "title": "Name",
                     "description": (
                         "Name given to infrastructure created by the worker using this "
                         "job configuration."
                     ),
                 },
-                "other": {"type": "string", "title": "Other"},
+                "other": {
+                    "title": "Other",
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": None,
+                },
             },
             "type": "object",
         },
@@ -420,7 +504,7 @@ async def test_base_worker_gets_job_configuration_when_syncing_with_backend_with
     response = await client.post(
         "/work_pools/", json=dict(name=pool_name, type="test-type")
     )
-    result = pydantic.parse_obj_as(schemas.core.WorkPool, response.json())
+    result = parse_obj_as(schemas.objects.WorkPool, response.json())
     model = await models.workers.read_work_pool(session=session, work_pool_id=result.id)
     assert model.name == pool_name
 
@@ -443,7 +527,9 @@ async def test_base_worker_gets_job_configuration_when_syncing_with_backend_with
     with a correct base_job_template when creating a new work pool"""
 
     class WorkerJobConfig(BaseJobConfiguration):
-        other: Optional[str] = Field(template="{{ other }}")
+        other: Optional[str] = Field(
+            default=None, json_schema_extra={"template": "{{ other }}"}
+        )
 
     class WorkerVariables(BaseVariables):
         other: Optional[str] = Field(default="woof")
@@ -453,59 +539,13 @@ async def test_base_worker_gets_job_configuration_when_syncing_with_backend_with
     WorkerTestImpl.job_configuration = WorkerJobConfig
     WorkerTestImpl.job_configuration_variables = WorkerVariables
 
-    worker_job_template = {
-        "job_configuration": {
-            "command": "{{ command }}",
-            "env": "{{ env }}",
-            "labels": "{{ labels }}",
-            "name": "{{ name }}",
-            "other": "{{ other }}",
-        },
-        "variables": {
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "title": "Command",
-                    "description": (
-                        "The command to use when starting a flow run. "
-                        "In most cases, this should be left blank and the command "
-                        "will be automatically generated by the worker."
-                    ),
-                },
-                "env": {
-                    "title": "Environment Variables",
-                    "type": "object",
-                    "additionalProperties": {"type": "string"},
-                    "description": (
-                        "Environment variables to set when starting a flow run."
-                    ),
-                },
-                "labels": {
-                    "title": "Labels",
-                    "type": "object",
-                    "additionalProperties": {"type": "string"},
-                    "description": (
-                        "Labels applied to infrastructure created by a worker."
-                    ),
-                },
-                "name": {
-                    "type": "string",
-                    "title": "Name",
-                    "description": "Name given to infrastructure created by a worker.",
-                },
-                "other": {"type": "string", "title": "Other", "default": "woof"},
-            },
-            "type": "object",
-        },
-    }
-
     pool_name = "test-pool"
 
     # Create a new worker pool
     response = await client.post(
         "/work_pools/", json=dict(name=pool_name, type="test-type")
     )
-    result = pydantic.parse_obj_as(schemas.core.WorkPool, response.json())
+    result = parse_obj_as(schemas.objects.WorkPool, response.json())
     model = await models.workers.read_work_pool(session=session, work_pool_id=result.id)
     assert model.name == pool_name
 
@@ -571,7 +611,7 @@ async def test_base_job_configuration_from_template_and_overrides(
     config = await BaseJobConfiguration.from_template_and_values(
         base_job_template=template, values=overrides
     )
-    assert config.dict() == expected
+    assert config.model_dump() == expected
 
 
 @pytest.mark.parametrize(
@@ -756,13 +796,13 @@ async def test_job_configuration_from_template_and_overrides(
     """Test that the job configuration is correctly built from the template and overrides"""
 
     class ArbitraryJobConfiguration(BaseJobConfiguration):
-        var1: str = Field(template="{{ var1 }}")
-        var2: int = Field(template="{{ var2 }}")
+        var1: str = Field(json_schema_extra={"template": "{{ var1 }}"})
+        var2: int = Field(json_schema_extra={"template": "{{ var2 }}"})
 
     config = await ArbitraryJobConfiguration.from_template_and_values(
         base_job_template=template, values=overrides
     )
-    assert config.dict() == expected
+    assert config.model_dump() == expected
 
 
 async def test_job_configuration_from_template_and_overrides_with_nested_variables():
@@ -790,12 +830,17 @@ async def test_job_configuration_from_template_and_overrides_with_nested_variabl
     }
 
     class ArbitraryJobConfiguration(BaseJobConfiguration):
-        config: dict = Field(template={"var1": "{{ var1 }}", "var2": "{{ var2 }}"})
+        config: Dict[str, Any] = Field(
+            json_schema_extra={
+                "template": {"var1": "{{ var1 }}", "var2": "{{ var2 }}"}
+            },
+            default_factory=dict,
+        )
 
     config = await ArbitraryJobConfiguration.from_template_and_values(
         base_job_template=template, values={"var1": "woof!"}
     )
-    assert config.dict() == {
+    assert config.model_dump() == {
         "command": None,
         "env": {},
         "labels": {},
@@ -814,12 +859,14 @@ async def test_job_configuration_from_template_and_overrides_with_hard_coded_pri
     }
 
     class ArbitraryJobConfiguration(BaseJobConfiguration):
-        config: dict = Field(template={"var1": 1, "var2": 1.1, "var3": True})
+        config: Dict[str, Any] = Field(
+            json_schema_extra={"template": {"var1": 1, "var2": 1.1, "var3": True}}
+        )
 
     config = await ArbitraryJobConfiguration.from_template_and_values(
         base_job_template=template, values={}
     )
-    assert config.dict() == {
+    assert config.model_dump() == {
         "command": None,
         "env": {},
         "labels": {},
@@ -875,22 +922,110 @@ async def test_job_configuration_from_template_overrides_with_block():
 
     block_id = await ArbitraryBlock(a=1, b="hello").save(name="arbitrary-block")
 
-    config = await ArbitraryJobConfiguration.from_template_and_values(
-        base_job_template=template,
-        values={
-            "var1": "woof!",
-            "arbitrary_block": {"$ref": {"block_document_id": block_id}},
-        },
+    config: ArbitraryJobConfiguration = (
+        await ArbitraryJobConfiguration.from_template_and_values(
+            base_job_template=template,
+            values={
+                "var1": "woof!",
+                "arbitrary_block": {"$ref": {"block_document_id": block_id}},
+            },
+        )
     )
 
-    assert config.dict() == {
+    assert config.model_dump() == {
         "command": None,
         "env": {},
         "labels": {},
         "name": None,
         "var1": "woof!",
-        # block_type_slug is added by Block.dict()
+        # block_type_slug is added by Block.model_dump()
         "arbitrary_block": {"a": 1, "b": "hello", "block_type_slug": "arbitraryblock"},
+    }
+
+    config = await ArbitraryJobConfiguration.from_template_and_values(
+        base_job_template=template,
+        values={
+            "var1": "woof!",
+            "arbitrary_block": "{{ prefect.blocks.arbitraryblock.arbitrary-block }}",
+        },
+    )
+
+    assert config.model_dump() == {
+        "command": None,
+        "env": {},
+        "labels": {},
+        "name": None,
+        "var1": "woof!",
+        # block_type_slug is added by Block.model_dump()
+        "arbitrary_block": {"a": 1, "b": "hello", "block_type_slug": "arbitraryblock"},
+    }
+
+
+@pytest.mark.usefixtures("variables")
+async def test_job_configuration_from_template_overrides_with_remote_variables():
+    template = {
+        "job_configuration": {
+            "var1": "{{ var1 }}",
+            "env": "{{ env }}",
+        },
+        "variables": {
+            "properties": {
+                "var1": {
+                    "type": "string",
+                },
+                "env": {
+                    "type": "object",
+                },
+            }
+        },
+    }
+
+    class ArbitraryJobConfiguration(BaseJobConfiguration):
+        var1: str
+        env: Dict[str, str]
+
+    config = await ArbitraryJobConfiguration.from_template_and_values(
+        base_job_template=template,
+        values={
+            "var1": "{{  prefect.variables.test_variable_1 }}",
+            "env": {"MY_ENV_VAR": "{{  prefect.variables.test_variable_2 }}"},
+        },
+    )
+
+    assert config.model_dump() == {
+        "command": None,
+        "env": {"MY_ENV_VAR": "test_value_2"},
+        "labels": {},
+        "name": None,
+        "var1": "test_value_1",
+    }
+
+
+@pytest.mark.usefixtures("variables")
+async def test_job_configuration_from_template_overrides_with_remote_variables_hardcodes():
+    template = {
+        "job_configuration": {
+            "var1": "{{ prefect.variables.test_variable_1 }}",
+            "env": {"MY_ENV_VAR": "{{ prefect.variables.test_variable_2 }}"},
+        },
+        "variables": {"properties": {}},
+    }
+
+    class ArbitraryJobConfiguration(BaseJobConfiguration):
+        var1: str
+        env: Dict[str, str]
+
+    config = await ArbitraryJobConfiguration.from_template_and_values(
+        base_job_template=template,
+        values={},
+    )
+
+    assert config.model_dump() == {
+        "command": None,
+        "env": {"MY_ENV_VAR": "test_value_2"},
+        "labels": {},
+        "name": None,
+        "var1": "test_value_1",
     }
 
 
@@ -914,12 +1049,14 @@ async def test_job_configuration_from_template_and_overrides_with_variables_in_a
     }
 
     class ArbitraryJobConfiguration(BaseJobConfiguration):
-        config: list = Field(template=["{{ var1 }}", "{{ var2 }}"])
+        config: list = Field(
+            json_schema_extra={"template": ["{{ var1 }}", "{{ var2 }}"]}
+        )
 
     config = await ArbitraryJobConfiguration.from_template_and_values(
         base_job_template=template, values={"var1": "woof!"}
     )
-    assert config.dict() == {
+    assert config.model_dump() == {
         "command": None,
         "env": {},
         "labels": {},
@@ -999,8 +1136,8 @@ def test_job_configuration_produces_correct_json_template(
     field_template_value, expected_final_template
 ):
     class ArbitraryJobConfiguration(BaseJobConfiguration):
-        var1: str = Field(template=field_template_value)
-        var2: int = Field(template="{{ var2 }}")
+        var1: str = Field(json_schema_extra={"template": field_template_value})
+        var2: int = Field(json_schema_extra={"template": "{{ var2 }}"})
 
     template = ArbitraryJobConfiguration.json_template()
     assert template == expected_final_template
@@ -1030,8 +1167,9 @@ class TestWorkerProperties:
             "variables": {
                 "properties": {
                     "command": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "title": "Command",
+                        "default": None,
                         "description": (
                             "The command to use when starting a flow run. "
                             "In most cases, this should be left blank and the command "
@@ -1041,7 +1179,9 @@ class TestWorkerProperties:
                     "env": {
                         "title": "Environment Variables",
                         "type": "object",
-                        "additionalProperties": {"type": "string"},
+                        "additionalProperties": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}]
+                        },
                         "description": (
                             "Environment variables to set when starting a flow run."
                         ),
@@ -1056,8 +1196,9 @@ class TestWorkerProperties:
                         ),
                     },
                     "name": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "title": "Name",
+                        "default": None,
                         "description": (
                             "Name given to infrastructure created by the worker using "
                             "this job configuration."
@@ -1120,8 +1261,8 @@ class TestWorkerProperties:
 
     def test_custom_base_job_configuration(self):
         class CustomBaseJobConfiguration(BaseJobConfiguration):
-            var1: str = Field(template="{{ var1 }}")
-            var2: int = Field(template="{{ var2 }}")
+            var1: str = Field(json_schema_extra={"template": "{{ var1 }}"})
+            var2: int = Field(json_schema_extra={"template": "{{ var2 }}"})
 
         class CustomBaseVariables(BaseVariables):
             var1: str = Field(default=...)
@@ -1138,56 +1279,63 @@ class TestWorkerProperties:
             async def verify_submitted_deployment(self, deployment):
                 pass
 
-        assert WorkerImplWithCustomBaseJobConfiguration.get_default_base_job_template() == {
-            "job_configuration": {
-                "command": "{{ command }}",
-                "env": "{{ env }}",
-                "labels": "{{ labels }}",
-                "name": "{{ name }}",
-                "var1": "{{ var1 }}",
-                "var2": "{{ var2 }}",
-            },
-            "variables": {
-                "properties": {
-                    "command": {
-                        "title": "Command",
-                        "type": "string",
-                        "description": (
-                            "The command to use when starting a flow run. "
-                            "In most cases, this should be left blank and the command "
-                            "will be automatically generated by the worker."
-                        ),
-                    },
-                    "env": {
-                        "title": "Environment Variables",
-                        "type": "object",
-                        "additionalProperties": {"type": "string"},
-                        "description": (
-                            "Environment variables to set when starting a flow run."
-                        ),
-                    },
-                    "labels": {
-                        "title": "Labels",
-                        "type": "object",
-                        "additionalProperties": {"type": "string"},
-                        "description": (
-                            "Labels applied to infrastructure created by a worker."
-                        ),
-                    },
-                    "name": {
-                        "title": "Name",
-                        "type": "string",
-                        "description": (
-                            "Name given to infrastructure created by a worker."
-                        ),
-                    },
-                    "var1": {"title": "Var1", "type": "string"},
-                    "var2": {"title": "Var2", "type": "integer", "default": 1},
+        assert (
+            WorkerImplWithCustomBaseJobConfiguration.get_default_base_job_template()
+            == {
+                "job_configuration": {
+                    "command": "{{ command }}",
+                    "env": "{{ env }}",
+                    "labels": "{{ labels }}",
+                    "name": "{{ name }}",
+                    "var1": "{{ var1 }}",
+                    "var2": "{{ var2 }}",
                 },
-                "required": ["var1"],
-                "type": "object",
-            },
-        }
+                "variables": {
+                    "properties": {
+                        "command": {
+                            "title": "Command",
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
+                            "default": None,
+                            "description": (
+                                "The command to use when starting a flow run. "
+                                "In most cases, this should be left blank and the command "
+                                "will be automatically generated by the worker."
+                            ),
+                        },
+                        "env": {
+                            "title": "Environment Variables",
+                            "type": "object",
+                            "additionalProperties": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}]
+                            },
+                            "description": (
+                                "Environment variables to set when starting a flow run."
+                            ),
+                        },
+                        "labels": {
+                            "title": "Labels",
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                            "description": (
+                                "Labels applied to infrastructure created by a worker."
+                            ),
+                        },
+                        "name": {
+                            "title": "Name",
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
+                            "default": None,
+                            "description": (
+                                "Name given to infrastructure created by a worker."
+                            ),
+                        },
+                        "var1": {"title": "Var1", "type": "string"},
+                        "var2": {"title": "Var2", "type": "integer", "default": 1},
+                    },
+                    "required": ["var1"],
+                    "type": "object",
+                },
+            }
+        )
 
 
 class TestPrepareForFlowRun:
@@ -1201,15 +1349,15 @@ class TestPrepareForFlowRun:
 
     @pytest.fixture
     def flow_run(self):
-        return FlowRun(name="my-flow-run-name")
-
-    @pytest.fixture
-    def deployment(self):
-        return DeploymentResponse(name="my-deployment-name")
+        return FlowRun(name="my-flow-run-name", flow_id=uuid.uuid4())
 
     @pytest.fixture
     def flow(self):
         return Flow(name="my-flow-name")
+
+    @pytest.fixture
+    def deployment(self, flow):
+        return DeploymentResponse(name="my-deployment-name", flow_id=flow.id)
 
     def test_prepare_for_flow_run_without_deployment_and_flow(
         self, job_config, flow_run
@@ -1219,7 +1367,7 @@ class TestPrepareForFlowRun:
         assert job_config.env == {
             **get_current_settings().to_environment_variables(exclude_unset=True),
             "MY_VAR": "foo",
-            "PREFECT__FLOW_RUN_ID": flow_run.id.hex,
+            "PREFECT__FLOW_RUN_ID": str(flow_run.id),
         }
         assert job_config.labels == {
             "my-label": "foo",
@@ -1228,7 +1376,27 @@ class TestPrepareForFlowRun:
             "prefect.io/version": prefect.__version__,
         }
         assert job_config.name == "my-job-name"
-        assert job_config.command == "python -m prefect.engine"
+        assert job_config.command == "prefect flow-run execute"
+
+    def test_prepare_for_flow_run_with_enhanced_cancellation(
+        self, job_config, flow_run, enable_enhanced_cancellation
+    ):
+        job_config.prepare_for_flow_run(flow_run)
+
+        assert job_config.env == {
+            **get_current_settings().to_environment_variables(exclude_unset=True),
+            "MY_VAR": "foo",
+            "PREFECT__FLOW_RUN_ID": str(flow_run.id),
+        }
+        assert job_config.labels == {
+            "my-label": "foo",
+            "prefect.io/flow-run-id": str(flow_run.id),
+            "prefect.io/flow-run-name": flow_run.name,
+            "prefect.io/version": prefect.__version__,
+        }
+        assert job_config.name == "my-job-name"
+        # only thing that changes is the command
+        assert job_config.command == "prefect flow-run execute"
 
     def test_prepare_for_flow_run_with_deployment_and_flow(
         self, job_config, flow_run, deployment, flow
@@ -1238,7 +1406,7 @@ class TestPrepareForFlowRun:
         assert job_config.env == {
             **get_current_settings().to_environment_variables(exclude_unset=True),
             "MY_VAR": "foo",
-            "PREFECT__FLOW_RUN_ID": flow_run.id.hex,
+            "PREFECT__FLOW_RUN_ID": str(flow_run.id),
         }
         assert job_config.labels == {
             "my-label": "foo",
@@ -1251,7 +1419,7 @@ class TestPrepareForFlowRun:
             "prefect.io/flow-name": flow.name,
         }
         assert job_config.name == "my-job-name"
-        assert job_config.command == "python -m prefect.engine"
+        assert job_config.command == "prefect flow-run execute"
 
 
 def legacy_named_cancelling_state(**kwargs):
@@ -1259,22 +1427,30 @@ def legacy_named_cancelling_state(**kwargs):
 
 
 class TestCancellation:
+    @pytest.fixture(autouse=True)
+    def disable_enhanced_cancellation(self, disable_enhanced_cancellation):
+        """
+        Workers only cancel flow runs when enhanced cancellation is disabled.
+        These tests are for the legacy cancellation behavior.
+        """
+
     @pytest.mark.parametrize(
         "cancelling_constructor", [legacy_named_cancelling_state, Cancelling]
     )
     async def test_worker_cancel_run_called_for_cancelling_run(
         self,
-        orion_client: PrefectClient,
-        deployment,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
         cancelling_constructor,
         work_pool,
     ):
-        flow_run = await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(),
         )
 
         async with WorkerTestImpl(work_pool_name=work_pool.name) as worker:
+            await worker.sync_with_backend()
             worker.cancel_run = AsyncMock()
             await worker.check_for_cancelled_flow_runs()
 
@@ -1294,14 +1470,15 @@ class TestCancellation:
         ],
     )
     async def test_worker_cancel_run_not_called_for_other_states(
-        self, orion_client: PrefectClient, deployment, state, work_pool
+        self, prefect_client: PrefectClient, worker_deployment_wq1, state, work_pool
     ):
-        await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=state,
         )
 
         async with WorkerTestImpl(work_pool_name=work_pool.name) as worker:
+            await worker.sync_with_backend()
             worker.cancel_run = AsyncMock()
             await worker.check_for_cancelled_flow_runs()
 
@@ -1312,19 +1489,15 @@ class TestCancellation:
     )
     async def test_worker_cancel_run_called_for_cancelling_run_with_multiple_work_queues(
         self,
-        orion_client: PrefectClient,
-        deployment,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
         cancelling_constructor,
         work_pool,
         work_queue_1,
         work_queue_2,
     ):
-        deployment.work_pool_name = work_pool.name
-        deployment.work_queue_name = work_queue_1.name
-        await orion_client.update_deployment(deployment)
-
-        flow_run = await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(),
         )
 
@@ -1332,6 +1505,7 @@ class TestCancellation:
             work_pool_name=work_pool.name,
             work_queues=[work_queue_1.name, work_queue_2.name],
         ) as worker:
+            await worker.sync_with_backend()
             worker.cancel_run = AsyncMock()
             await worker.check_for_cancelled_flow_runs()
 
@@ -1342,7 +1516,7 @@ class TestCancellation:
     )
     async def test_worker_cancel_run_not_called_for_same_queue_names_in_different_work_pool(
         self,
-        orion_client: PrefectClient,
+        prefect_client: PrefectClient,
         deployment,
         cancelling_constructor,
         work_pool,
@@ -1351,9 +1525,9 @@ class TestCancellation:
     ):
         # Update queue name, but not work pool name
         deployment.work_queue_name = work_queue_1.name
-        await orion_client.update_deployment(deployment)
+        await prefect_client.update_deployment(deployment)
 
-        flow_run = await orion_client.create_flow_run_from_deployment(
+        await prefect_client.create_flow_run_from_deployment(
             deployment.id,
             state=cancelling_constructor(),
         )
@@ -1362,6 +1536,7 @@ class TestCancellation:
             work_pool_name=work_pool.name,
             work_queues=[work_queue_1.name],
         ) as worker:
+            await worker.sync_with_backend()
             worker.cancel_run = AsyncMock()
             await worker.check_for_cancelled_flow_runs()
 
@@ -1371,18 +1546,23 @@ class TestCancellation:
         "cancelling_constructor", [legacy_named_cancelling_state, Cancelling]
     )
     async def test_worker_cancel_run_not_called_for_other_work_queues(
-        self, orion_client: PrefectClient, deployment, cancelling_constructor, work_pool
+        self,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
+        cancelling_constructor,
+        work_pool,
     ):
-        await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(),
         )
 
         async with WorkerTestImpl(
             work_pool_name=work_pool.name,
-            work_queues=[f"not-{deployment.work_queue_name}"],
+            work_queues=[f"not-{worker_deployment_wq1.work_queue_name}"],
             prefetch_seconds=10,
         ) as worker:
+            await worker.sync_with_backend()
             worker.cancel_run = AsyncMock()
             await worker.check_for_cancelled_flow_runs()
 
@@ -1394,56 +1574,63 @@ class TestCancellation:
         "cancelling_constructor", [legacy_named_cancelling_state, Cancelling]
     )
     async def test_worker_cancel_run_kills_run_with_infrastructure_pid(
-        self, orion_client: PrefectClient, deployment, cancelling_constructor, work_pool
+        self,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
+        cancelling_constructor,
+        work_pool,
     ):
-        flow_run = await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(),
         )
 
-        await orion_client.update_flow_run(flow_run.id, infrastructure_pid="test")
+        await prefect_client.update_flow_run(flow_run.id, infrastructure_pid="test")
 
         async with WorkerTestImpl(
             work_pool_name=work_pool.name, prefetch_seconds=10
         ) as worker:
+            await worker.sync_with_backend()
             worker.kill_infrastructure = AsyncMock()
             await worker.check_for_cancelled_flow_runs()
 
-        worker.kill_infrastructure.assert_awaited_once_with("test")
+        worker.kill_infrastructure.assert_awaited_once_with(
+            infrastructure_pid="test", configuration=ANY
+        )
 
     @pytest.mark.parametrize(
         "cancelling_constructor", [legacy_named_cancelling_state, Cancelling]
     )
     async def test_worker_cancel_run_with_missing_infrastructure_pid(
         self,
-        orion_client: PrefectClient,
-        deployment,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
         caplog,
         cancelling_constructor,
         work_pool,
     ):
-        flow_run = await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(),
         )
 
         async with WorkerTestImpl(
             work_pool_name=work_pool.name, prefetch_seconds=10
         ) as worker:
+            await worker.sync_with_backend()
             worker.kill_infrastructure = AsyncMock()
             await worker.check_for_cancelled_flow_runs()
 
         worker.kill_infrastructure.assert_not_awaited()
 
         # State name updated to prevent further attempts
-        post_flow_run = await orion_client.read_flow_run(flow_run.id)
+        post_flow_run = await prefect_client.read_flow_run(flow_run.id)
         assert post_flow_run.state.name == "Cancelled"
 
         # Information broadcasted to user in logs and state message
         assert (
             "does not have an infrastructure pid attached. Cancellation cannot be"
-            " guaranteed."
-            in caplog.text
+            " guaranteed." in caplog.text
         )
         assert (
             "missing infrastructure tracking information" in post_flow_run.state.message
@@ -1453,69 +1640,110 @@ class TestCancellation:
         "cancelling_constructor", [legacy_named_cancelling_state, Cancelling]
     )
     async def test_worker_cancel_run_updates_state_type(
-        self, orion_client: PrefectClient, deployment, cancelling_constructor, work_pool
+        self,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
+        cancelling_constructor,
+        work_pool,
     ):
-        flow_run = await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(),
         )
 
-        await orion_client.update_flow_run(flow_run.id, infrastructure_pid="test")
+        await prefect_client.update_flow_run(flow_run.id, infrastructure_pid="test")
 
         async with WorkerTestImpl(
             work_pool_name=work_pool.name, prefetch_seconds=10
         ) as worker:
+            await worker.sync_with_backend()
             await worker.check_for_cancelled_flow_runs()
 
-        post_flow_run = await orion_client.read_flow_run(flow_run.id)
+        post_flow_run = await prefect_client.read_flow_run(flow_run.id)
+        assert post_flow_run.state.type == StateType.CANCELLED
+
+    @pytest.mark.parametrize(
+        "cancelling_constructor", [legacy_named_cancelling_state, Cancelling]
+    )
+    @pytest.mark.parametrize("infrastructure_pid", [None, "", "test"])
+    async def test_worker_cancel_run_handles_missing_deployment(
+        self,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
+        cancelling_constructor,
+        work_pool,
+        infrastructure_pid: str,
+    ):
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
+            state=cancelling_constructor(),
+        )
+        await prefect_client.update_flow_run(
+            flow_run.id, infrastructure_pid=infrastructure_pid
+        )
+        await prefect_client.delete_deployment(worker_deployment_wq1.id)
+
+        async with WorkerTestImpl(
+            work_pool_name=work_pool.name, prefetch_seconds=10
+        ) as worker:
+            await worker.sync_with_backend()
+            await worker.check_for_cancelled_flow_runs()
+
+        post_flow_run = await prefect_client.read_flow_run(flow_run.id)
         assert post_flow_run.state.type == StateType.CANCELLED
 
     @pytest.mark.parametrize(
         "cancelling_constructor", [legacy_named_cancelling_state, Cancelling]
     )
     async def test_worker_cancel_run_preserves_other_state_properties(
-        self, orion_client: PrefectClient, deployment, cancelling_constructor, work_pool
+        self,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
+        cancelling_constructor,
+        work_pool,
     ):
-        expected_changed_fields = {"type", "name", "timestamp", "id"}
+        expected_changed_fields = {"type", "name", "timestamp", "id", "state_details"}
 
-        flow_run = await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(message="test"),
         )
 
-        await orion_client.update_flow_run(flow_run.id, infrastructure_pid="test")
+        await prefect_client.update_flow_run(flow_run.id, infrastructure_pid="test")
 
         async with WorkerTestImpl(
             work_pool_name=work_pool.name, prefetch_seconds=10
         ) as worker:
+            await worker.sync_with_backend()
             await worker.check_for_cancelled_flow_runs()
 
-        post_flow_run = await orion_client.read_flow_run(flow_run.id)
-        assert post_flow_run.state.dict(
+        post_flow_run = await prefect_client.read_flow_run(flow_run.id)
+        assert post_flow_run.state.model_dump(
             exclude=expected_changed_fields
-        ) == flow_run.state.dict(exclude=expected_changed_fields)
+        ) == flow_run.state.model_dump(exclude=expected_changed_fields)
 
     @pytest.mark.parametrize(
         "cancelling_constructor", [legacy_named_cancelling_state, Cancelling]
     )
     async def test_worker_cancel_run_with_infrastructure_not_available_during_kill(
         self,
-        orion_client: PrefectClient,
-        deployment,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
         caplog,
         cancelling_constructor,
         work_pool,
     ):
-        flow_run = await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(),
         )
 
-        await orion_client.update_flow_run(flow_run.id, infrastructure_pid="test")
+        await prefect_client.update_flow_run(flow_run.id, infrastructure_pid="test")
 
         async with WorkerTestImpl(
             work_pool_name=work_pool.name, prefetch_seconds=10
         ) as worker:
+            await worker.sync_with_backend()
             worker.kill_infrastructure = AsyncMock()
             worker.kill_infrastructure.side_effect = InfrastructureNotAvailable("Test!")
             await worker.check_for_cancelled_flow_runs()
@@ -1524,10 +1752,12 @@ class TestCancellation:
             await worker.check_for_cancelled_flow_runs()
 
         # Only awaited once
-        worker.kill_infrastructure.assert_awaited_once_with("test")
+        worker.kill_infrastructure.assert_awaited_once_with(
+            infrastructure_pid="test", configuration=ANY
+        )
 
         # State name not updated; other workers may attempt the kill
-        post_flow_run = await orion_client.read_flow_run(flow_run.id)
+        post_flow_run = await prefect_client.read_flow_run(flow_run.id)
         assert post_flow_run.state.name == "Cancelling"
 
         # Exception message is included with note on worker action
@@ -1541,22 +1771,23 @@ class TestCancellation:
     )
     async def test_worker_cancel_run_with_infrastructure_not_found_during_kill(
         self,
-        orion_client: PrefectClient,
-        deployment,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
         caplog,
         cancelling_constructor,
         work_pool,
     ):
-        flow_run = await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(),
         )
 
-        await orion_client.update_flow_run(flow_run.id, infrastructure_pid="test")
+        await prefect_client.update_flow_run(flow_run.id, infrastructure_pid="test")
 
         async with WorkerTestImpl(
             work_pool_name=work_pool.name, prefetch_seconds=10
         ) as worker:
+            await worker.sync_with_backend()
             worker.kill_infrastructure = AsyncMock()
             worker.kill_infrastructure.side_effect = InfrastructureNotFound("Test!")
             await worker.check_for_cancelled_flow_runs()
@@ -1564,10 +1795,12 @@ class TestCancellation:
             await worker.check_for_cancelled_flow_runs()
 
         # Only awaited once
-        worker.kill_infrastructure.assert_awaited_once_with("test")
+        worker.kill_infrastructure.assert_awaited_once_with(
+            infrastructure_pid="test", configuration=ANY
+        )
 
         # State name updated to prevent further attempts
-        post_flow_run = await orion_client.read_flow_run(flow_run.id)
+        post_flow_run = await prefect_client.read_flow_run(flow_run.id)
         assert post_flow_run.state.name == "Cancelled"
 
         # Exception message is included with note on worker action
@@ -1581,21 +1814,22 @@ class TestCancellation:
     )
     async def test_worker_cancel_run_with_unknown_error_during_kill(
         self,
-        orion_client: PrefectClient,
-        deployment,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
         caplog,
         cancelling_constructor,
         work_pool,
     ):
-        flow_run = await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(),
         )
-        await orion_client.update_flow_run(flow_run.id, infrastructure_pid="test")
+        await prefect_client.update_flow_run(flow_run.id, infrastructure_pid="test")
 
         async with WorkerTestImpl(
             work_pool_name=work_pool.name, prefetch_seconds=10
         ) as worker:
+            await worker.sync_with_backend()
             worker.kill_infrastructure = AsyncMock()
             worker.kill_infrastructure.side_effect = ValueError("Oh no!")
             await worker.check_for_cancelled_flow_runs()
@@ -1603,10 +1837,15 @@ class TestCancellation:
             await worker.check_for_cancelled_flow_runs()
 
         # Multiple attempts should be made
-        worker.kill_infrastructure.assert_has_awaits([call("test"), call("test")])
+        worker.kill_infrastructure.assert_has_awaits(
+            [
+                call(infrastructure_pid="test", configuration=ANY),
+                call(infrastructure_pid="test", configuration=ANY),
+            ]
+        )
 
         # State name not updated
-        post_flow_run = await orion_client.read_flow_run(flow_run.id)
+        post_flow_run = await prefect_client.read_flow_run(flow_run.id)
         assert post_flow_run.state.name == "Cancelling"
 
         assert (
@@ -1621,8 +1860,8 @@ class TestCancellation:
     )
     async def test_worker_cancel_run_without_infrastructure_support_for_kill(
         self,
-        orion_client: PrefectClient,
-        deployment,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
         caplog,
         cancelling_constructor,
         work_pool,
@@ -1635,25 +1874,219 @@ class TestCancellation:
             async def run(self, flow_run, configuration, task_status=None):
                 pass
 
-        flow_run = await orion_client.create_flow_run_from_deployment(
-            deployment.id,
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
             state=cancelling_constructor(),
         )
-        await orion_client.update_flow_run(flow_run.id, infrastructure_pid="test")
+        await prefect_client.update_flow_run(flow_run.id, infrastructure_pid="test")
 
         async with WorkerNoKill(
             work_pool_name=work_pool.name, prefetch_seconds=10
         ) as worker:
+            await worker.sync_with_backend()
             await worker.check_for_cancelled_flow_runs()
 
         # State name not updated; another worker may have a code version that supports
         # killing this flow run
-        post_flow_run = await orion_client.read_flow_run(flow_run.id)
+        post_flow_run = await prefect_client.read_flow_run(flow_run.id)
         assert post_flow_run.state.name == "Cancelling"
 
         assert (
             f"Worker type {worker_type!r} does not support killing created"
-            " infrastructure."
-            in caplog.text
+            " infrastructure." in caplog.text
         )
         assert "Cancellation cannot be guaranteed." in caplog.text
+
+    @pytest.mark.parametrize(
+        "cancelling_constructor", [legacy_named_cancelling_state, Cancelling]
+    )
+    async def test_worker_cancel_run_skips_with_runner(
+        self,
+        prefect_client: PrefectClient,
+        worker_deployment_wq1,
+        caplog,
+        cancelling_constructor,
+        enable_enhanced_cancellation,
+        work_pool,
+    ):
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id,
+            state=cancelling_constructor(),
+        )
+
+        async with WorkerTestImpl(work_pool_name=work_pool.name) as worker:
+            await worker.sync_with_backend()
+            await worker.check_for_cancelled_flow_runs()
+
+        post_flow_run = await prefect_client.read_flow_run(flow_run.id)
+        # shouldn't change state
+        assert post_flow_run.state.type == cancelling_constructor().type
+
+        assert "Skipping cancellation because flow run" in caplog.text
+        assert "is using enhanced cancellation" in caplog.text
+
+
+async def test_get_flow_run_logger(
+    prefect_client: PrefectClient, worker_deployment_wq1, work_pool
+):
+    flow_run = await prefect_client.create_flow_run_from_deployment(
+        worker_deployment_wq1.id
+    )
+
+    async with WorkerTestImpl(
+        name="test", work_pool_name=work_pool.name, create_pool_if_not_found=False
+    ) as worker:
+        await worker.sync_with_backend()
+        logger = worker.get_flow_run_logger(flow_run)
+
+        assert logger.name == "prefect.flow_runs.worker"
+        assert logger.extra == {
+            "flow_run_name": flow_run.name,
+            "flow_run_id": str(flow_run.id),
+            "flow_name": "<unknown>",
+            "worker_name": "test",
+            "work_pool_name": work_pool.name,
+            "work_pool_id": str(work_pool.id),
+        }
+
+
+class TestInfrastructureIntegration:
+    async def test_worker_crashes_flow_if_infrastructure_submission_fails(
+        self,
+        prefect_client: PrefectClient,
+        worker_deployment_infra_wq1,
+        work_pool,
+        monkeypatch,
+    ):
+        flow_run = await prefect_client.create_flow_run_from_deployment(
+            worker_deployment_infra_wq1.id,
+            state=Scheduled(scheduled_time=pendulum.now("utc")),
+        )
+        await prefect_client.read_flow(worker_deployment_infra_wq1.flow_id)
+
+        def raise_value_error():
+            raise ValueError("Hello!")
+
+        mock_run = MagicMock()
+        mock_run.run = raise_value_error
+
+        async with WorkerTestImpl(work_pool_name=work_pool.name) as worker:
+            worker._work_pool = work_pool
+            monkeypatch.setattr(worker, "run", mock_run)
+            monkeypatch.setattr(worker, "run", mock_run)
+            await worker.get_and_submit_flow_runs()
+
+        state = (await prefect_client.read_flow_run(flow_run.id)).state
+        assert state.is_crashed()
+        with pytest.raises(
+            CrashedRun, match="Flow run could not be submitted to infrastructure"
+        ):
+            await state.result()
+
+
+async def test_worker_set_last_polled_time(
+    work_pool,
+):
+    now = pendulum.now("utc")
+
+    # https://github.com/PrefectHQ/prefect/issues/11619
+    # Pendulum 3 Test Case
+    if version.parse(pendulum.__version__) >= version.parse("3.0"):
+        # https://github.com/sdispater/pendulum/blob/master/docs/docs/testing.md
+        with pendulum.travel_to(now, freeze=True):
+            async with WorkerTestImpl(work_pool_name=work_pool.name) as worker:
+                # initially, the worker should have _last_polled_time set to now
+                assert worker._last_polled_time == now
+
+                # some arbitrary delta forward
+                now2 = now.add(seconds=49)
+                with pendulum.travel_to(now2, freeze=True):
+                    await worker.get_and_submit_flow_runs()
+                    assert worker._last_polled_time == now2
+
+                # some arbitrary datetime
+                now3 = pendulum.datetime(2021, 1, 1, 0, 0, 0, tz="utc")
+                with pendulum.travel_to(now3, freeze=True):
+                    await worker.get_and_submit_flow_runs()
+                    assert worker._last_polled_time == now3
+
+    # Pendulum 2 Test Case
+    else:
+        pendulum.set_test_now(now)
+        async with WorkerTestImpl(work_pool_name=work_pool.name) as worker:
+            # initially, the worker should have _last_polled_time set to now
+            assert worker._last_polled_time == now
+
+            # some arbitrary delta forward
+            now2 = now.add(seconds=49)
+            pendulum.set_test_now(now2)
+            await worker.get_and_submit_flow_runs()
+            assert worker._last_polled_time == now2
+
+            # some arbitrary datetime
+            now3 = pendulum.datetime(2021, 1, 1, 0, 0, 0, tz="utc")
+            pendulum.set_test_now(now3)
+            await worker.get_and_submit_flow_runs()
+            assert worker._last_polled_time == now3
+
+            # cleanup mock
+            pendulum.set_test_now()
+
+
+async def test_worker_last_polled_health_check(
+    work_pool,
+):
+    now = pendulum.now("utc")
+
+    # https://github.com/PrefectHQ/prefect/issues/11619
+    # Pendulum 3 Test Case
+    if version.parse(pendulum.__version__) >= version.parse("3.0"):
+        # https://github.com/sdispater/pendulum/blob/master/docs/docs/testing.md
+        pendulum.travel_to(now, freeze=True)
+
+        async with WorkerTestImpl(work_pool_name=work_pool.name) as worker:
+            resp = worker.is_worker_still_polling(query_interval_seconds=10)
+            assert resp is True
+
+            with pendulum.travel(seconds=299):
+                resp = worker.is_worker_still_polling(query_interval_seconds=10)
+                assert resp is True
+
+            with pendulum.travel(seconds=301):
+                resp = worker.is_worker_still_polling(query_interval_seconds=10)
+                assert resp is False
+
+            with pendulum.travel(minutes=30):
+                resp = worker.is_worker_still_polling(query_interval_seconds=60)
+                assert resp is True
+
+            with pendulum.travel(minutes=30, seconds=1):
+                resp = worker.is_worker_still_polling(query_interval_seconds=60)
+                assert resp is False
+
+    # Pendulum 2 Test Case
+    else:
+        pendulum.set_test_now(now)
+
+        async with WorkerTestImpl(work_pool_name=work_pool.name) as worker:
+            resp = worker.is_worker_still_polling(query_interval_seconds=10)
+            assert resp is True
+
+            pendulum.set_test_now(now.add(seconds=299))
+            resp = worker.is_worker_still_polling(query_interval_seconds=10)
+            assert resp is True
+
+            pendulum.set_test_now(now.add(seconds=301))
+            resp = worker.is_worker_still_polling(query_interval_seconds=10)
+            assert resp is False
+
+            pendulum.set_test_now(now.add(minutes=30))
+            resp = worker.is_worker_still_polling(query_interval_seconds=60)
+            assert resp is True
+
+            pendulum.set_test_now(now.add(minutes=30, seconds=1))
+            resp = worker.is_worker_still_polling(query_interval_seconds=60)
+            assert resp is False
+
+            # cleanup mock
+            pendulum.set_test_now()

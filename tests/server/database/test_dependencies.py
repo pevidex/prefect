@@ -1,8 +1,9 @@
+import datetime
 import inspect
-from pathlib import Path
+from uuid import UUID
 
 import pytest
-import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from prefect.server.database import dependencies
 from prefect.server.database.configurations import (
@@ -15,13 +16,13 @@ from prefect.server.database.interface import PrefectDBInterface
 from prefect.server.database.orm_models import (
     AioSqliteORMConfiguration,
     AsyncPostgresORMConfiguration,
-    BaseORMConfiguration,
 )
 from prefect.server.database.query_components import (
     AioSqliteQueryComponents,
     AsyncPostgresQueryComponents,
     BaseQueryComponents,
 )
+from prefect.server.schemas.graph import Graph
 
 
 @pytest.mark.parametrize(
@@ -49,6 +50,9 @@ async def test_injecting_a_really_dumb_database_database_config():
             ...
 
         def is_inmemory(self, engine):
+            ...
+
+        async def begin_transaction(self, session, locked):
             ...
 
     with dependencies.temporary_database_config(
@@ -117,12 +121,21 @@ async def test_injecting_really_dumb_query_components():
             pass
 
         def get_scheduled_flow_runs_from_work_queues(
-            self, db, limit_per_queue, work_queue_ids, scheduled_before
+            self, limit_per_queue, work_queue_ids, scheduled_before
         ):
             ...
 
         def _get_scheduled_flow_runs_from_work_pool_template_path(self):
             ...
+
+        async def flow_run_graph_v2(
+            self,
+            session: AsyncSession,
+            flow_run_id: UUID,
+            since: datetime,
+            max_nodes: int,
+        ) -> Graph:
+            raise NotImplementedError()
 
     with dependencies.temporary_query_components(ReallyBrokenQueries()):
         db = dependencies.provide_database_interface()
@@ -136,40 +149,6 @@ async def test_injecting_existing_orm_configs(ORMConfig):
     with dependencies.temporary_orm_config(ORMConfig()):
         db = dependencies.provide_database_interface()
         assert type(db.orm) == ORMConfig
-
-
-async def test_injecting_really_dumb_orm_configuration():
-    class UselessORMConfiguration(BaseORMConfiguration):
-        def run_migrations(self):
-            ...
-
-        @property
-        def versions_dir(self):
-            return Path("")
-
-    class UselessBaseMixin:
-        my_string_column = sa.Column(
-            sa.String, nullable=False, default="Mostly harmless"
-        )
-
-    with dependencies.temporary_orm_config(
-        UselessORMConfiguration(
-            base_metadata=sa.schema.MetaData(schema="new_schema"),
-            base_model_mixins=[UselessBaseMixin],
-        )
-    ):
-        db = dependencies.provide_database_interface()
-        assert type(db.orm) == UselessORMConfiguration
-
-        # base mixins should be used to create orm models
-        assert "my_string_column" in db.Flow.__table__.columns.keys()
-        # base metadata should specify a different schema
-        assert db.Base.metadata.schema == "new_schema"
-
-    # orm properties should be unset after we exit context
-    db = dependencies.provide_database_interface()
-    assert "my_string_column" not in db.Flow.__table__.columns.keys()
-    assert db.Base.metadata.schema != "new_schema"
 
 
 async def test_inject_db(db):

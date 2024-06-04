@@ -10,18 +10,31 @@ the instance so the same settings can be used to load saved objects.
 All serializers must implement `dumps` and `loads` which convert objects to bytes and
 bytes to an object respectively.
 """
+
 import abc
 import base64
-import warnings
-from typing import Any, Generic, Optional, TypeVar
+from typing import Any, Dict, Generic, Optional, Type, TypeVar
 
-import pydantic
-from pydantic import BaseModel
-from pydantic.json import pydantic_encoder
-from typing_extensions import Literal
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+)
+from typing_extensions import Literal, Self
 
+from prefect._internal.schemas.validators import (
+    cast_type_names_to_serializers,
+    validate_compressionlib,
+    validate_dump_kwargs,
+    validate_load_kwargs,
+    validate_picklelib,
+)
+from prefect.utilities.dispatch import get_dispatch_key, lookup_type, register_base_type
 from prefect.utilities.importtools import from_qualified_name, to_qualified_name
-from prefect.utilities.pydantic import add_type_dispatch
+from prefect.utilities.pydantic import custom_pydantic_encoder
 
 D = TypeVar("D")
 
@@ -37,7 +50,7 @@ def prefect_json_object_encoder(obj: Any) -> Any:
     else:
         return {
             "__class__": to_qualified_name(obj.__class__),
-            "data": pydantic_encoder(obj),
+            "data": custom_pydantic_encoder({}, obj),
         }
 
 
@@ -47,8 +60,8 @@ def prefect_json_object_decoder(result: dict):
     with `prefect_json_object_encoder`
     """
     if "__class__" in result:
-        return pydantic.parse_obj_as(
-            from_qualified_name(result["__class__"]), result["data"]
+        return TypeAdapter(from_qualified_name(result["__class__"])).validate_python(
+            result["data"]
         )
     elif "__exc_type__" in result:
         return from_qualified_name(result["__exc_type__"])(result["message"])
@@ -56,11 +69,27 @@ def prefect_json_object_decoder(result: dict):
         return result
 
 
-@add_type_dispatch
+@register_base_type
 class Serializer(BaseModel, Generic[D], abc.ABC):
     """
     A serializer that can encode objects of type 'D' into bytes.
     """
+
+    def __init__(self, **data: Any) -> None:
+        type_string = get_dispatch_key(self) if type(self) != Serializer else "__base__"
+        data.setdefault("type", type_string)
+        super().__init__(**data)
+
+    def __new__(cls: Type[Self], **kwargs) -> Self:
+        if "type" in kwargs:
+            try:
+                subcls = lookup_type(cls, dispatch_key=kwargs["type"])
+            except KeyError as exc:
+                raise ValidationError(errors=[exc], model=cls)
+
+            return super().__new__(subcls)
+        else:
+            return super().__new__(cls)
 
     type: str
 
@@ -72,8 +101,12 @@ class Serializer(BaseModel, Generic[D], abc.ABC):
     def loads(self, blob: bytes) -> D:
         """Decode the blob of bytes into an object."""
 
-    class Config:
-        extra = "forbid"
+    model_config = ConfigDict(extra="forbid")
+
+    @classmethod
+    def __dispatch_key__(cls) -> str:
+        type_str = cls.model_fields["type"].default
+        return type_str if isinstance(type_str, str) else None
 
 
 class PickleSerializer(Serializer):
@@ -89,61 +122,15 @@ class PickleSerializer(Serializer):
     type: Literal["pickle"] = "pickle"
 
     picklelib: str = "cloudpickle"
-    picklelib_version: str = None
+    picklelib_version: Optional[str] = None
 
-    @pydantic.validator("picklelib")
+    @field_validator("picklelib")
     def check_picklelib(cls, value):
-        """
-        Check that the given pickle library is importable and has dumps/loads methods.
-        """
-        try:
-            pickler = from_qualified_name(value)
-        except (ImportError, AttributeError) as exc:
-            raise ValueError(
-                f"Failed to import requested pickle library: {value!r}."
-            ) from exc
+        return validate_picklelib(value)
 
-        if not callable(getattr(pickler, "dumps", None)):
-            raise ValueError(
-                f"Pickle library at {value!r} does not have a 'dumps' method."
-            )
-
-        if not callable(getattr(pickler, "loads", None)):
-            raise ValueError(
-                f"Pickle library at {value!r} does not have a 'loads' method."
-            )
-
-        return value
-
-    @pydantic.root_validator
-    def check_picklelib_version(cls, values):
-        """
-        Infers a default value for `picklelib_version` if null or ensures it matches
-        the version retrieved from the `pickelib`.
-        """
-        picklelib = values.get("picklelib")
-        picklelib_version = values.get("picklelib_version")
-
-        if not picklelib:
-            raise ValueError("Unable to check version of unrecognized picklelib module")
-
-        pickler = from_qualified_name(picklelib)
-        pickler_version = getattr(pickler, "__version__", None)
-
-        if not picklelib_version:
-            values["picklelib_version"] = pickler_version
-        elif picklelib_version != pickler_version:
-            warnings.warn(
-                (
-                    f"Mismatched {picklelib!r} versions. Found {pickler_version} in the"
-                    f" environment but {picklelib_version} was requested. This may"
-                    " cause the serializer to fail."
-                ),
-                RuntimeWarning,
-                stacklevel=3,
-            )
-
-        return values
+    # @model_validator(mode="before")
+    # def check_picklelib_version(cls, values):
+    #     return validate_picklelib_version(values)
 
     def dumps(self, obj: Any) -> bytes:
         pickler = from_qualified_name(self.picklelib)
@@ -165,16 +152,17 @@ class JSONSerializer(Serializer):
     """
 
     type: Literal["json"] = "json"
+
     jsonlib: str = "json"
-    object_encoder: Optional[str] = pydantic.Field(
+    object_encoder: Optional[str] = Field(
         default="prefect.serializers.prefect_json_object_encoder",
         description=(
             "An optional callable to use when serializing objects that are not "
             "supported by the JSON encoder. By default, this is set to a callable that "
-            "adds support for all types supported by Pydantic."
+            "adds support for all types supported by "
         ),
     )
-    object_decoder: Optional[str] = pydantic.Field(
+    object_decoder: Optional[str] = Field(
         default="prefect.serializers.prefect_json_object_decoder",
         description=(
             "An optional callable to use when deserializing objects. This callable "
@@ -183,28 +171,16 @@ class JSONSerializer(Serializer):
             "by our default `object_encoder`."
         ),
     )
-    dumps_kwargs: dict = pydantic.Field(default_factory=dict)
-    loads_kwargs: dict = pydantic.Field(default_factory=dict)
+    dumps_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    loads_kwargs: Dict[str, Any] = Field(default_factory=dict)
 
-    @pydantic.validator("dumps_kwargs")
+    @field_validator("dumps_kwargs")
     def dumps_kwargs_cannot_contain_default(cls, value):
-        # `default` is set by `object_encoder`. A user provided callable would make this
-        # class unserializable anyway.
-        if "default" in value:
-            raise ValueError(
-                "`default` cannot be provided. Use `object_encoder` instead."
-            )
-        return value
+        return validate_dump_kwargs(value)
 
-    @pydantic.validator("loads_kwargs")
+    @field_validator("loads_kwargs")
     def loads_kwargs_cannot_contain_object_hook(cls, value):
-        # `object_hook` is set by `object_decoder`. A user provided callable would make
-        # this class unserializable anyway.
-        if "object_hook" in value:
-            raise ValueError(
-                "`object_hook` cannot be provided. Use `object_decoder` instead."
-            )
-        return value
+        return validate_load_kwargs(value)
 
     def dumps(self, data: Any) -> bytes:
         json = from_qualified_name(self.jsonlib)
@@ -242,45 +218,22 @@ class CompressedSerializer(Serializer):
     serializer: Serializer
     compressionlib: str = "lzma"
 
-    @pydantic.validator("serializer", pre=True)
-    def cast_type_names_to_serializers(cls, value):
-        if isinstance(value, str):
-            return Serializer(type=value)
-        return value
+    @field_validator("serializer", mode="before")
+    def validate_serializer(cls, value):
+        return cast_type_names_to_serializers(value)
 
-    @pydantic.validator("compressionlib")
+    @field_validator("compressionlib")
     def check_compressionlib(cls, value):
-        """
-        Check that the given pickle library is importable and has compress/decompress
-        methods.
-        """
-        try:
-            compresser = from_qualified_name(value)
-        except (ImportError, AttributeError) as exc:
-            raise ValueError(
-                f"Failed to import requested compression library: {value!r}."
-            ) from exc
-
-        if not callable(getattr(compresser, "compress", None)):
-            raise ValueError(
-                f"Compression library at {value!r} does not have a 'compress' method."
-            )
-
-        if not callable(getattr(compresser, "decompress", None)):
-            raise ValueError(
-                f"Compression library at {value!r} does not have a 'decompress' method."
-            )
-
-        return value
+        return validate_compressionlib(value)
 
     def dumps(self, obj: Any) -> bytes:
         blob = self.serializer.dumps(obj)
-        compresser = from_qualified_name(self.compressionlib)
-        return base64.encodebytes(compresser.compress(blob))
+        compressor = from_qualified_name(self.compressionlib)
+        return base64.encodebytes(compressor.compress(blob))
 
     def loads(self, blob: bytes) -> Any:
-        compresser = from_qualified_name(self.compressionlib)
-        uncompressed = compresser.decompress(base64.decodebytes(blob))
+        compressor = from_qualified_name(self.compressionlib)
+        uncompressed = compressor.decompress(base64.decodebytes(blob))
         return self.serializer.loads(uncompressed)
 
 
@@ -290,7 +243,8 @@ class CompressedPickleSerializer(CompressedSerializer):
     """
 
     type: Literal["compressed/pickle"] = "compressed/pickle"
-    serializer: Serializer = pydantic.Field(default_factory=PickleSerializer)
+
+    serializer: Serializer = Field(default_factory=PickleSerializer)
 
 
 class CompressedJSONSerializer(CompressedSerializer):
@@ -299,4 +253,5 @@ class CompressedJSONSerializer(CompressedSerializer):
     """
 
     type: Literal["compressed/json"] = "compressed/json"
-    serializer: Serializer = pydantic.Field(default_factory=JSONSerializer)
+
+    serializer: Serializer = Field(default_factory=JSONSerializer)

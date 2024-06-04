@@ -15,29 +15,16 @@ from prefect.states import (
     Completed,
     Crashed,
     Failed,
+    Paused,
     Pending,
     Running,
     State,
     StateGroup,
-    is_state,
     is_state_iterable,
     raise_state_exception,
     return_value_to_state,
 )
 from prefect.utilities.annotations import quote
-
-
-def test_is_state():
-    assert is_state(Completed())
-
-
-def test_is_not_state():
-    assert not is_state(None)
-    assert not is_state("test")
-
-
-def test_is_state_requires_instance():
-    assert not is_state(Completed)
 
 
 @pytest.mark.parametrize("iterable_type", [set, list, tuple])
@@ -58,7 +45,12 @@ def test_is_not_state_iterable_if_empty(iterable_type):
 class TestRaiseStateException:
     def test_works_in_sync_context(self, state_cls):
         with pytest.raises(ValueError, match="Test"):
-            raise_state_exception(state_cls(data=ValueError("Test")))
+
+            @flow
+            def test_flow():
+                raise_state_exception(state_cls(data=ValueError("Test")))
+
+            test_flow()
 
     async def test_raises_state_exception(self, state_cls):
         with pytest.raises(ValueError, match="Test"):
@@ -145,8 +137,8 @@ class TestRaiseStateException:
 
 class TestReturnValueToState:
     @pytest.fixture
-    async def factory(self, orion_client):
-        return await ResultFactory.default_factory(client=orion_client)
+    async def factory(self, prefect_client):
+        return await ResultFactory.default_factory(client=prefect_client)
 
     async def test_returns_single_state_unaltered(self, factory):
         state = Completed(data="hello!")
@@ -159,13 +151,24 @@ class TestReturnValueToState:
         assert isinstance(result_state.data, UnpersistedResult)
         assert await result_state.result() is None
 
-    async def test_returns_single_state_with_data_to_persist(self, factory):
-        factory.persist_result = True
+    async def test_returns_single_state_with_data_to_persist(self, prefect_client):
+        factory = await ResultFactory.default_factory(
+            client=prefect_client, persist_result=True
+        )
         state = Completed(data=1)
         result_state = await return_value_to_state(state, factory)
         assert result_state is state
         assert isinstance(result_state.data, PersistedResult)
         assert await result_state.result() == 1
+
+    async def test_returns_persisted_results_unaltered(self, prefect_client):
+        factory = await ResultFactory.default_factory(
+            client=prefect_client, persist_result=True
+        )
+        result = await factory.create_result(42)
+        result_state = await return_value_to_state(result, factory)
+        assert result_state.data == result
+        assert await result_state.result() == 42
 
     async def test_returns_single_state_unaltered_with_user_created_reference(
         self, factory
@@ -277,6 +280,21 @@ class TestStateGroup:
 
         assert not StateGroup(states).any_cancelled()
 
+    def test_any_paused(self):
+        states = [
+            Paused(),
+            Failed(data=ValueError("1")),
+        ]
+
+        assert StateGroup(states).any_paused()
+
+        states = [
+            Completed(data="test"),
+            Failed(data=ValueError("1")),
+        ]
+
+        assert not StateGroup(states).any_paused()
+
     def test_any_failed(self):
         states = [
             Completed(data="test"),
@@ -308,6 +326,16 @@ class TestStateGroup:
             Crashed(data=ValueError("crashed")),
             Completed(data="complete"),
             Cancelled(data="cancelled"),
+            Running(),
+        ]
+
+        assert not StateGroup(states).all_final()
+
+        states = [
+            Failed(data=ValueError("failed")),
+            Crashed(data=ValueError("crashed")),
+            Completed(data="complete"),
+            Paused(data="paused"),
             Running(),
         ]
 

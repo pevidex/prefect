@@ -1,19 +1,20 @@
 """
 Utilities for managing worker threads.
 """
+
 import asyncio
 import atexit
 import concurrent.futures
 import itertools
 import queue
 import threading
-from typing import Optional
+from typing import List, Optional
 
+from prefect._internal.concurrency import logger
 from prefect._internal.concurrency.calls import Call, Portal
+from prefect._internal.concurrency.cancellation import CancelledError
+from prefect._internal.concurrency.event_loop import get_running_loop
 from prefect._internal.concurrency.primitives import Event
-from prefect.logging import get_logger
-
-logger = get_logger("prefect._internal.concurrency.threads")
 
 
 class WorkerThread(Portal):
@@ -88,6 +89,8 @@ class WorkerThread(Portal):
         """
         try:
             self._run_until_shutdown()
+        except CancelledError:
+            logger.exception("%s was cancelled", self.name)
         except BaseException:
             # Log exceptions that crash the thread
             logger.exception("%s encountered exception", self.name)
@@ -131,6 +134,8 @@ class EventLoopThread(Portal):
         self._shutdown_event: Event = Event()
         self._run_once: bool = run_once
         self._submitted_count: int = 0
+        self._on_shutdown: List[Call] = []
+        self._lock = threading.Lock()
 
         if not daemon:
             atexit.register(self.shutdown)
@@ -139,31 +144,34 @@ class EventLoopThread(Portal):
         """
         Start the worker thread; raises any exceptions encountered during startup.
         """
-        self.thread.start()
-        # Wait for the worker to be ready
-        self._ready_future.result()
+        with self._lock:
+            if self._loop is None:
+                self.thread.start()
+                self._ready_future.result()
 
     def submit(self, call: Call) -> Call:
-        if self._submitted_count > 0 and self._run_once:
-            raise RuntimeError(
-                "Worker configured to only run once. A call has already been submitted."
-            )
-
         if self._loop is None:
             self.start()
 
-        if self._shutdown_event.is_set():
-            raise RuntimeError("Worker is shutdown.")
+        with self._lock:
+            if self._submitted_count > 0 and self._run_once:
+                raise RuntimeError(
+                    "Worker configured to only run once. A call has already been"
+                    " submitted."
+                )
 
-        # Track the portal running the call
-        call.set_runner(self)
+            if self._shutdown_event.is_set():
+                raise RuntimeError("Worker is shutdown.")
 
-        # Submit the call to the event loop
-        asyncio.run_coroutine_threadsafe(self._run_call(call), self._loop)
+            # Track the portal running the call
+            call.set_runner(self)
 
-        self._submitted_count += 1
-        if self._run_once:
-            call.future.add_done_callback(lambda _: self.shutdown())
+            # Submit the call to the event loop
+            asyncio.run_coroutine_threadsafe(self._run_call(call), self._loop)
+
+            self._submitted_count += 1
+            if self._run_once:
+                call.future.add_done_callback(lambda _: self.shutdown())
 
         return call
 
@@ -171,10 +179,11 @@ class EventLoopThread(Portal):
         """
         Shutdown the worker thread. Does not wait for the thread to stop.
         """
-        if self._shutdown_event is None:
-            return
+        with self._lock:
+            if self._shutdown_event is None:
+                return
 
-        self._shutdown_event.set()
+            self._shutdown_event.set()
 
     @property
     def name(self) -> str:
@@ -203,10 +212,19 @@ class EventLoopThread(Portal):
 
         await self._shutdown_event.wait()
 
+        for call in self._on_shutdown:
+            await self._run_call(call)
+
+        # Empty the list to allow calls to be garbage collected. Issue #10338.
+        self._on_shutdown = []
+
     async def _run_call(self, call: Call) -> None:
         task = call.run()
         if task is not None:
             await task
+
+    def add_shutdown_call(self, call: Call) -> None:
+        self._on_shutdown.append(call)
 
     def __enter__(self):
         self.start()
@@ -216,7 +234,10 @@ class EventLoopThread(Portal):
         self.shutdown()
 
 
+# the GLOBAL LOOP is used for background services, like logs
 GLOBAL_LOOP: Optional[EventLoopThread] = None
+# the RUN SYNC LOOP is used exclusively for running async functions in a sync context via asyncutils.run_sync
+RUN_SYNC_LOOP: Optional[EventLoopThread] = None
 
 
 def get_global_loop() -> EventLoopThread:
@@ -239,7 +260,49 @@ def get_global_loop() -> EventLoopThread:
     return GLOBAL_LOOP
 
 
-def wait_for_global_loop_exit() -> None:
+def in_global_loop() -> bool:
+    """
+    Check if called from the global loop.
+    """
+    if GLOBAL_LOOP is None:
+        # Avoid creating a global loop if there isn't one
+        return False
+
+    return get_global_loop()._loop == get_running_loop()
+
+
+def get_run_sync_loop() -> EventLoopThread:
+    """
+    Get the run_sync loop thread.
+
+    Creates a new one if there is not one available.
+    """
+    global RUN_SYNC_LOOP
+
+    # Create a new worker on first call or if the existing worker is dead
+    if (
+        RUN_SYNC_LOOP is None
+        or not RUN_SYNC_LOOP.thread.is_alive()
+        or RUN_SYNC_LOOP._shutdown_event.is_set()
+    ):
+        RUN_SYNC_LOOP = EventLoopThread(daemon=True, name="RunSyncEventLoopThread")
+        RUN_SYNC_LOOP.start()
+
+    return RUN_SYNC_LOOP
+
+
+def in_run_sync_loop() -> bool:
+    """
+    Check if called from the global loop.
+    """
+    if RUN_SYNC_LOOP is None:
+        # Avoid creating a global loop if there isn't one
+        return False
+
+    return get_run_sync_loop()._loop == get_running_loop()
+
+
+def wait_for_global_loop_exit(timeout: Optional[float] = None) -> None:
     """
     Shutdown the global loop and wait for it to exit.
     """
@@ -249,4 +312,4 @@ def wait_for_global_loop_exit() -> None:
     if threading.get_ident() == loop_thread.thread.ident:
         raise RuntimeError("Cannot wait for the loop thread from inside itself.")
 
-    loop_thread.thread.join()
+    loop_thread.thread.join(timeout)

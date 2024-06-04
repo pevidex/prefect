@@ -4,12 +4,18 @@ import { routes, NamedRoute, AppRouteLocation, AppRouteRecord } from '@/router/r
 import { BASE_URL } from '@/utilities/meta'
 
 const workspaceRoutes = createWorkspaceRouteRecords({
+  automation: () => import('@/pages/Automation.vue'),
+  automations: () => import('@/pages/Automations.vue'),
+  automationCreate: () => import('@/pages/AutomationCreate.vue'),
+  automationEdit: () => import('@/pages/AutomationEdit.vue'),
+  events: () => import('@/pages/Events.vue'),
+  event: () => import('@/pages/Event.vue'),
   artifact: () => import('@/pages/Artifact.vue'),
   artifactKey: () => import('@/pages/ArtifactKey.vue'),
   artifacts: () => import('@/pages/Artifacts.vue'),
-  flowRuns: () => import('@/pages/FlowRuns.vue'),
+  dashboard: () => import('@/pages/Dashboard.vue'),
+  runs: () => import('@/pages/Runs.vue'),
   flowRun: () => import('@/pages/FlowRun.vue'),
-  flowRunRadar: () => import('@/pages/FlowRunRadar.vue'),
   taskRun: () => import('@/pages/TaskRun.vue'),
   flows: () => import('@/pages/Flows.vue'),
   flow: () => import('@/pages/Flow.vue'),
@@ -46,7 +52,7 @@ const routeRecords: AppRouteRecord[] = [
   {
     name: 'root',
     path: '/',
-    redirect: routes.flowRuns(),
+    redirect: routes.dashboard(),
     children: workspaceRoutes,
   },
   {

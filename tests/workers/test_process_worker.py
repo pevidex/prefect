@@ -3,6 +3,7 @@ import socket
 import sys
 import uuid
 from pathlib import Path
+from typing import Any, Dict, Optional
 from unittest.mock import call
 from uuid import UUID
 
@@ -10,17 +11,28 @@ import anyio
 import anyio.abc
 import pendulum
 import pytest
+from exceptiongroup import ExceptionGroup, catch
 from pydantic import BaseModel
+from pydantic_extra_types.pendulum_dt import DateTime
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import prefect
 from prefect import flow
+from prefect.client import schemas as client_schemas
 from prefect.client.orchestration import PrefectClient
 from prefect.client.schemas import State
-from prefect.exceptions import InfrastructureNotAvailable, InfrastructureNotFound
-from prefect.server.schemas.core import WorkPool
-from prefect.server.schemas.states import StateDetails, StateType
+from prefect.exceptions import InfrastructureNotAvailable
+from prefect.server import models
+from prefect.server.schemas.actions import (
+    DeploymentUpdate,
+    WorkPoolCreate,
+)
 from prefect.testing.utilities import AsyncMock, MagicMock
-from prefect.workers.process import ProcessWorker, ProcessWorkerResult
+from prefect.workers.process import (
+    ProcessJobConfiguration,
+    ProcessWorker,
+    ProcessWorkerResult,
+)
 
 
 @flow
@@ -42,18 +54,36 @@ def patch_run_process(monkeypatch):
 
 
 @pytest.fixture
-async def flow_run(orion_client: PrefectClient):
-    flow_run = await orion_client.create_flow_run(
+async def flow_run(prefect_client: PrefectClient):
+    flow_run = await prefect_client.create_flow_run(
         flow=example_process_worker_flow,
         state=State(
-            type=StateType.SCHEDULED,
-            state_details=StateDetails(
+            type=client_schemas.StateType.SCHEDULED,
+            state_details=client_schemas.StateDetails(
                 scheduled_time=pendulum.now("utc").subtract(minutes=5)
             ),
         ),
     )
 
     return flow_run
+
+
+@pytest.fixture
+async def flow_run_with_overrides(deployment, prefect_client: PrefectClient):
+    flow_run = await prefect_client.create_flow_run_from_deployment(
+        deployment_id=deployment.id,
+        state=State(
+            type=client_schemas.StateType.SCHEDULED,
+            state_details=client_schemas.StateDetails(
+                scheduled_time=pendulum.now("utc").subtract(minutes=5)
+            ),
+        ),
+    )
+    await prefect_client.update_flow_run(
+        flow_run_id=flow_run.id,
+        job_variables={"working_dir": "/tmp/test"},
+    )
+    return await prefect_client.read_flow_run(flow_run.id)
 
 
 @pytest.fixture
@@ -74,14 +104,14 @@ def mock_open_process(monkeypatch):
         yield anyio.open_process
 
 
-def patch_client(monkeypatch, overrides: dict = None):
+def patch_client(monkeypatch, overrides: Optional[Dict[str, Any]] = None):
     """Patches client to return a mock deployment and mock flow with the specified overrides"""
 
     class MockDeployment(BaseModel):
         id: UUID = uuid.uuid4()
-        infra_overrides: dict = overrides or {}
+        job_variables: Dict[str, Any] = overrides or {}
         name: str = "test-deployment"
-        updated: pendulum.DateTime = pendulum.now("utc")
+        updated: DateTime = pendulum.now("utc")
 
     class MockFlow(BaseModel):
         id: UUID = uuid.uuid4()
@@ -103,33 +133,48 @@ def patch_client(monkeypatch, overrides: dict = None):
 
 
 @pytest.fixture
-def work_pool():
+async def work_pool(session: AsyncSession):
     job_template = ProcessWorker.get_default_base_job_template()
 
-    work_pool = MagicMock(spec=WorkPool)
-    work_pool.name = "test-worker-pool"
-    work_pool.base_job_template = job_template
-    return work_pool
+    wp = await models.workers.create_work_pool(
+        session=session,
+        work_pool=WorkPoolCreate.model_construct(
+            _fields_set=WorkPoolCreate.model_fields_set,
+            name="test-worker-pool",
+            type="test",
+            description="None",
+            base_job_template=job_template,
+        ),
+    )
+    await session.commit()
+    return wp
 
 
 @pytest.fixture
-def work_pool_with_default_env():
+async def work_pool_with_default_env(session: AsyncSession):
     job_template = ProcessWorker.get_default_base_job_template()
     job_template["variables"]["properties"]["env"]["default"] = {
         "CONFIG_ENV_VAR": "from_job_configuration"
     }
-
-    work_pool = MagicMock(spec=WorkPool)
-    work_pool.name = "test-worker-pool"
-    work_pool.base_job_template = job_template
-    return work_pool
+    wp = await models.workers.create_work_pool(
+        session=session,
+        work_pool=WorkPoolCreate.model_construct(
+            _fields_set=WorkPoolCreate.model_fields_set,
+            name="wp-1",
+            type="test",
+            description="None",
+            base_job_template=job_template,
+        ),
+    )
+    await session.commit()
+    return wp
 
 
 async def test_worker_process_run_flow_run(
     flow_run, patch_run_process, work_pool, monkeypatch
 ):
     mock: AsyncMock = patch_run_process()
-    read_deployment_mock = patch_client(monkeypatch)
+    patch_client(monkeypatch)
 
     async with ProcessWorker(
         work_pool_name=work_pool.name,
@@ -151,7 +196,7 @@ async def test_worker_process_run_flow_run(
                 "prefect.engine",
             ],
         )
-        assert mock.call_args.kwargs["env"]["PREFECT__FLOW_RUN_ID"] == flow_run.id.hex
+        assert mock.call_args.kwargs["env"]["PREFECT__FLOW_RUN_ID"] == str(flow_run.id)
 
 
 async def test_worker_process_run_flow_run_with_env_variables_job_config_defaults(
@@ -159,7 +204,7 @@ async def test_worker_process_run_flow_run_with_env_variables_job_config_default
 ):
     monkeypatch.setenv("EXISTING_ENV_VAR", "from_os")
     mock: AsyncMock = patch_run_process()
-    read_deployment_mock = patch_client(monkeypatch)
+    patch_client(monkeypatch)
 
     async with ProcessWorker(
         work_pool_name=work_pool_with_default_env.name,
@@ -181,7 +226,7 @@ async def test_worker_process_run_flow_run_with_env_variables_job_config_default
                 "prefect.engine",
             ],
         )
-        assert mock.call_args.kwargs["env"]["PREFECT__FLOW_RUN_ID"] == flow_run.id.hex
+        assert mock.call_args.kwargs["env"]["PREFECT__FLOW_RUN_ID"] == str(flow_run.id)
         assert mock.call_args.kwargs["env"]["EXISTING_ENV_VAR"] == "from_os"
         assert (
             mock.call_args.kwargs["env"]["CONFIG_ENV_VAR"] == "from_job_configuration"
@@ -193,9 +238,7 @@ async def test_worker_process_run_flow_run_with_env_variables_from_overrides(
 ):
     monkeypatch.setenv("EXISTING_ENV_VAR", "from_os")
     mock: AsyncMock = patch_run_process()
-    read_deployment_mock = patch_client(
-        monkeypatch, overrides={"env": {"NEW_ENV_VAR": "from_deployment"}}
-    )
+    patch_client(monkeypatch, overrides={"env": {"NEW_ENV_VAR": "from_deployment"}})
 
     async with ProcessWorker(
         work_pool_name=work_pool_with_default_env.name,
@@ -217,9 +260,78 @@ async def test_worker_process_run_flow_run_with_env_variables_from_overrides(
                 "prefect.engine",
             ],
         )
-        assert mock.call_args.kwargs["env"]["PREFECT__FLOW_RUN_ID"] == flow_run.id.hex
+        assert mock.call_args.kwargs["env"]["PREFECT__FLOW_RUN_ID"] == str(flow_run.id)
         assert mock.call_args.kwargs["env"]["EXISTING_ENV_VAR"] == "from_os"
         assert mock.call_args.kwargs["env"]["NEW_ENV_VAR"] == "from_deployment"
+
+
+async def test_flow_run_without_job_vars(
+    flow_run,
+    work_pool_with_default_env,
+    monkeypatch,
+):
+    deployment_job_vars = {"working_dir": "/deployment/tmp/test"}
+    patch_client(monkeypatch, overrides=deployment_job_vars)
+
+    async with ProcessWorker(
+        work_pool_name=work_pool_with_default_env.name,
+    ) as worker:
+        worker._work_pool = work_pool_with_default_env
+        config = await worker._get_configuration(flow_run)
+        assert str(config.working_dir) == deployment_job_vars["working_dir"]
+
+
+async def test_flow_run_vars_take_precedence(
+    deployment,
+    flow_run_with_overrides,
+    work_pool_with_default_env,
+    session: AsyncSession,
+):
+    await models.deployments.update_deployment(
+        session=session,
+        deployment_id=deployment.id,
+        deployment=DeploymentUpdate(
+            job_variables={"working_dir": "/deployment/tmp/test"},
+        ),
+    )
+    await session.commit()
+
+    async with ProcessWorker(
+        work_pool_name=work_pool_with_default_env.name,
+    ) as worker:
+        worker._work_pool = work_pool_with_default_env
+        config = await worker._get_configuration(flow_run_with_overrides)
+        assert (
+            str(config.working_dir)
+            == flow_run_with_overrides.job_variables["working_dir"]
+        )
+
+
+async def test_flow_run_vars_and_deployment_vars_get_merged(
+    deployment,
+    flow_run_with_overrides,
+    work_pool_with_default_env,
+    session: AsyncSession,
+):
+    await models.deployments.update_deployment(
+        session=session,
+        deployment_id=deployment.id,
+        deployment=DeploymentUpdate(
+            job_variables={"stream_output": False},
+        ),
+    )
+    await session.commit()
+
+    async with ProcessWorker(
+        work_pool_name=work_pool_with_default_env.name,
+    ) as worker:
+        worker._work_pool = work_pool_with_default_env
+        config = await worker._get_configuration(flow_run_with_overrides)
+        assert (
+            str(config.working_dir)
+            == flow_run_with_overrides.job_variables["working_dir"]
+        )
+        assert config.stream_output is False
 
 
 async def test_process_created_then_marked_as_started(
@@ -229,10 +341,18 @@ async def test_process_created_then_marked_as_started(
     # By raising an exception when started is called we can assert the process
     # is opened before this time
     fake_status.started.side_effect = RuntimeError("Started called!")
-    read_deployment_mock = patch_client(monkeypatch)
+    patch_client(monkeypatch)
     fake_configuration = MagicMock()
     fake_configuration.command = "echo hello"
-    with pytest.raises(RuntimeError, match="Started called!"):
+
+    def handle_exception_group(excgrp: ExceptionGroup):
+        assert len(excgrp.exceptions) == 1
+        assert isinstance(excgrp.exceptions[0], RuntimeError)
+        assert str(excgrp.exceptions[0]) == "Started called!"
+
+    with catch(  # should be superseded by `ExceptionGroup` once we're 3.11+
+        {RuntimeError: handle_exception_group}  # type: ignore
+    ):  # see https://github.com/agronholm/anyio/blob/master/docs/migration.rst#task-groups-now-wrap-single-exceptions-in-groups # noqa F821
         async with ProcessWorker(
             work_pool_name=work_pool.name,
         ) as worker:
@@ -266,7 +386,7 @@ async def test_process_worker_logs_exit_code_help_message(
     work_pool,
     monkeypatch,
 ):
-    read_deployment_mock = patch_client(monkeypatch)
+    patch_client(monkeypatch)
     patch_run_process(returncode=exit_code)
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         worker._work_pool = work_pool
@@ -290,7 +410,7 @@ async def test_windows_process_worker_run_sets_process_group_creation_flag(
     patch_run_process, flow_run, work_pool, monkeypatch
 ):
     mock = patch_run_process()
-    read_deployment_mock = patch_client(monkeypatch)
+    patch_client(monkeypatch)
 
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         worker._work_pool = work_pool
@@ -314,7 +434,7 @@ async def test_unix_process_worker_run_does_not_set_creation_flag(
     patch_run_process, flow_run, work_pool, monkeypatch
 ):
     mock = patch_run_process()
-    read_deployment_mock = patch_client(monkeypatch)
+    patch_client(monkeypatch)
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         worker._work_pool = work_pool
         await worker.run(
@@ -334,7 +454,7 @@ async def test_process_worker_working_dir_override(
     path_override_value = "/tmp/test"
 
     # Check default is not the mock_path
-    read_deployment_mock = patch_client(monkeypatch, overrides={})
+    patch_client(monkeypatch, overrides={})
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         worker._work_pool = work_pool
         result = await worker.run(
@@ -347,9 +467,7 @@ async def test_process_worker_working_dir_override(
         assert mock.call_args.kwargs["cwd"] != Path(path_override_value)
 
     # Check mock_path is used after setting the override
-    read_deployment_mock = patch_client(
-        monkeypatch, overrides={"working_dir": path_override_value}
-    )
+    patch_client(monkeypatch, overrides={"working_dir": path_override_value})
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         worker._work_pool = work_pool
         result = await worker.run(
@@ -368,7 +486,7 @@ async def test_process_worker_stream_output_override(
     mock: AsyncMock = patch_run_process()
 
     # Check default is True
-    read_deployment_mock = patch_client(monkeypatch, overrides={})
+    patch_client(monkeypatch, overrides={})
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         worker._work_pool = work_pool
         result = await worker.run(
@@ -378,10 +496,10 @@ async def test_process_worker_stream_output_override(
 
         assert isinstance(result, ProcessWorkerResult)
         assert result.status_code == 0
-        assert mock.call_args.kwargs["stream_output"] == True
+        assert mock.call_args.kwargs["stream_output"] is True
 
     # Check False is used after setting the override
-    read_deployment_mock = patch_client(monkeypatch, overrides={"stream_output": False})
+    patch_client(monkeypatch, overrides={"stream_output": False})
 
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         worker._work_pool = work_pool
@@ -392,7 +510,7 @@ async def test_process_worker_stream_output_override(
 
         assert isinstance(result, ProcessWorkerResult)
         assert result.status_code == 0
-        assert mock.call_args.kwargs["stream_output"] == False
+        assert mock.call_args.kwargs["stream_output"] is False
 
 
 async def test_process_worker_uses_correct_default_command(
@@ -404,7 +522,7 @@ async def test_process_worker_uses_correct_default_command(
         "-m",
         "prefect.engine",
     ]
-    read_deployment_mock = patch_client(monkeypatch)
+    patch_client(monkeypatch)
 
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         worker._work_pool = work_pool
@@ -424,7 +542,7 @@ async def test_process_worker_command_override(
     mock: AsyncMock = patch_run_process()
     override_command = "echo hello world"
     override = {"command": override_command}
-    read_deployment_mock = patch_client(monkeypatch, overrides=override)
+    patch_client(monkeypatch, overrides=override)
 
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         worker._work_pool = work_pool
@@ -463,17 +581,12 @@ async def test_process_kill_mismatching_hostname(monkeypatch, work_pool):
 
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         with pytest.raises(InfrastructureNotAvailable):
-            await worker.kill_infrastructure(infrastructure_pid=infrastructure_pid)
+            await worker.kill_infrastructure(
+                infrastructure_pid=infrastructure_pid,
+                configuration=ProcessJobConfiguration(),
+            )
 
     os_kill.assert_not_called()
-
-
-async def test_process_kill_no_matching_pid(monkeypatch, work_pool):
-    infrastructure_pid = f"{socket.gethostname()}:12345"
-
-    async with ProcessWorker(work_pool_name=work_pool.name) as worker:
-        with pytest.raises(InfrastructureNotFound):
-            await worker.kill_infrastructure(infrastructure_pid=infrastructure_pid)
 
 
 @pytest.mark.skipif(
@@ -481,6 +594,7 @@ async def test_process_kill_no_matching_pid(monkeypatch, work_pool):
     reason="SIGTERM/SIGKILL are only used in non-Windows environments",
 )
 async def test_process_kill_sends_sigterm_then_sigkill(monkeypatch, work_pool):
+    patch_client(monkeypatch)
     os_kill = MagicMock()
     monkeypatch.setattr("os.kill", os_kill)
 
@@ -489,7 +603,9 @@ async def test_process_kill_sends_sigterm_then_sigkill(monkeypatch, work_pool):
 
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         await worker.kill_infrastructure(
-            infrastructure_pid=infrastructure_pid, grace_seconds=grace_seconds
+            infrastructure_pid=infrastructure_pid,
+            grace_seconds=grace_seconds,
+            configuration=ProcessJobConfiguration(),
         )
 
     os_kill.assert_has_calls(
@@ -506,17 +622,20 @@ async def test_process_kill_sends_sigterm_then_sigkill(monkeypatch, work_pool):
     reason="SIGTERM/SIGKILL are only used in non-Windows environments",
 )
 async def test_process_kill_early_return(monkeypatch, work_pool):
+    patch_client(monkeypatch)
     os_kill = MagicMock(side_effect=[None, ProcessLookupError])
     anyio_sleep = AsyncMock()
     monkeypatch.setattr("os.kill", os_kill)
-    monkeypatch.setattr("prefect.infrastructure.process.anyio.sleep", anyio_sleep)
+    monkeypatch.setattr("prefect.workers.process.anyio.sleep", anyio_sleep)
 
     infrastructure_pid = f"{socket.gethostname()}:12345"
     grace_seconds = 30
 
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         await worker.kill_infrastructure(
-            infrastructure_pid=infrastructure_pid, grace_seconds=grace_seconds
+            infrastructure_pid=infrastructure_pid,
+            grace_seconds=grace_seconds,
+            configuration=ProcessJobConfiguration(),
         )
 
     os_kill.assert_has_calls(
@@ -534,6 +653,7 @@ async def test_process_kill_early_return(monkeypatch, work_pool):
     reason="CTRL_BREAK_EVENT is only defined in Windows",
 )
 async def test_process_kill_windows_sends_ctrl_break(monkeypatch, work_pool):
+    patch_client(monkeypatch)
     os_kill = MagicMock()
     monkeypatch.setattr("os.kill", os_kill)
 
@@ -542,7 +662,9 @@ async def test_process_kill_windows_sends_ctrl_break(monkeypatch, work_pool):
 
     async with ProcessWorker(work_pool_name=work_pool.name) as worker:
         await worker.kill_infrastructure(
-            infrastructure_pid=infrastructure_pid, grace_seconds=grace_seconds
+            infrastructure_pid=infrastructure_pid,
+            grace_seconds=grace_seconds,
+            configuration=ProcessJobConfiguration(),
         )
 
     os_kill.assert_called_once_with(12345, signal.CTRL_BREAK_EVENT)

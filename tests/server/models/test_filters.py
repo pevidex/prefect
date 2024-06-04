@@ -1,20 +1,44 @@
-import json
+import asyncio
 from datetime import timedelta
 from uuid import uuid4
 
 import pendulum
-import pydantic
 import pytest
+from pydantic_core import from_json, to_json
+from sqlalchemy.exc import InterfaceError
 
+import prefect.server
 from prefect.client import get_client
 from prefect.server import models
 from prefect.server.schemas import actions, core, filters, schedules, states
 
 
 @pytest.fixture(autouse=True, scope="module")
-async def clear_db():
-    """Prevent automatic database-clearing behavior after every test"""
-    pass  # noqa
+async def clear_db(db):
+    """Clear DB only once before running tests in this module."""
+    max_retries = 3
+    retry_delay = 1
+
+    for attempt in range(max_retries):
+        try:
+            async with db.session_context(begin_transaction=True) as session:
+                await session.execute(db.Agent.__table__.delete())
+                await session.execute(db.WorkPool.__table__.delete())
+
+                for table in reversed(db.Base.metadata.sorted_tables):
+                    await session.execute(table.delete())
+                break
+        except InterfaceError:
+            if attempt < max_retries - 1:
+                print(
+                    "Connection issue. Retrying entire deletion operation"
+                    f" ({attempt + 1}/{max_retries})..."
+                )
+                await asyncio.sleep(retry_delay)
+            else:
+                raise
+
+    yield
 
 
 d_1_1_id = uuid4()
@@ -40,7 +64,7 @@ def adjust_kwargs_for_client(kwargs):
         else:
             raise ValueError("Unrecognized filter")
         adjusted_kwargs[k] = v
-    return adjusted_kwargs
+    return from_json(to_json(adjusted_kwargs))
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -50,16 +74,20 @@ async def data(flow_function, db):
     # auto-generated names never conflict.
 
     async with db.session_context(begin_transaction=True) as session:
-        create_flow = lambda flow: models.flows.create_flow(session=session, flow=flow)
-        create_deployment = lambda deployment: models.deployments.create_deployment(
-            session=session, deployment=deployment
-        )
-        create_flow_run = lambda flow_run: models.flow_runs.create_flow_run(
-            session=session, flow_run=flow_run
-        )
-        create_task_run = lambda task_run: models.task_runs.create_task_run(
-            session=session, task_run=task_run
-        )
+
+        def create_flow(flow):
+            return models.flows.create_flow(session=session, flow=flow)
+
+        def create_deployment(deployment):
+            return models.deployments.create_deployment(
+                session=session, deployment=deployment
+            )
+
+        def create_flow_run(flow_run):
+            return models.flow_runs.create_flow_run(session=session, flow_run=flow_run)
+
+        def create_task_run(task_run):
+            return models.task_runs.create_task_run(session=session, task_run=task_run)
 
         wp = await models.workers.create_work_pool(
             session=session, work_pool=actions.WorkPoolCreate(name="Test Pool")
@@ -78,6 +106,7 @@ async def data(flow_function, db):
                 manifest_path="file.json",
                 schedule=schedules.IntervalSchedule(interval=timedelta(days=1)),
                 is_schedule_active=True,
+                paused=False,
             )
         )
         d_1_2 = await create_deployment(
@@ -87,6 +116,7 @@ async def data(flow_function, db):
                 manifest_path="file.json",
                 flow_id=f_1.id,
                 is_schedule_active=False,
+                paused=True,
                 work_queue_name="test-queue-for-filters",
             )
         )
@@ -98,6 +128,7 @@ async def data(flow_function, db):
                 flow_id=f_3.id,
                 schedule=schedules.IntervalSchedule(interval=timedelta(days=1)),
                 is_schedule_active=True,
+                paused=False,
                 work_queue_id=wp.default_queue_id,
             )
         )
@@ -109,51 +140,51 @@ async def data(flow_function, db):
                 flow_id=f_1.id,
                 name="test-happy-duck",
                 tags=["db", "blue"],
-                state=states.Completed(),
+                state=prefect.server.schemas.states.Completed(),
                 deployment_id=d_1_1.id,
             )
         )
 
-        fr_1_2 = await create_flow_run(
+        await create_flow_run(
             flow_run=core.FlowRun(
                 flow_id=f_1.id,
                 name="sad-duck",
                 tags=["db", "blue"],
-                state=states.Completed(),
+                state=prefect.server.schemas.states.Completed(),
             )
         )
-        fr_1_3 = await create_flow_run(
+        await create_flow_run(
             flow_run=core.FlowRun(
                 flow_id=f_1.id,
                 name="test-happy-mallard",
                 tags=["db", "red"],
-                state=states.Failed(),
+                state=prefect.server.schemas.states.Failed(),
                 deployment_id=d_1_1.id,
             )
         )
-        fr_1_4 = await create_flow_run(
+        await create_flow_run(
             flow_run=core.FlowRun(
                 flow_id=f_1.id,
                 tags=["red"],
-                state=states.Running(),
+                state=prefect.server.schemas.states.Running(),
             )
         )
-        fr_1_5 = await create_flow_run(
+        await create_flow_run(
             flow_run=core.FlowRun(
                 flow_id=f_1.id,
-                state=states.Running(),
+                state=prefect.server.schemas.states.Running(),
                 deployment_id=d_1_2.id,
             )
         )
 
         # ---- flow 2
 
-        fr_2_1 = await create_flow_run(
+        await create_flow_run(
             flow_run=core.FlowRun(
                 flow_id=f_2.id,
                 name="another-test-happy-duck",
                 tags=["db", "blue"],
-                state=states.Completed(),
+                state=prefect.server.schemas.states.Completed(),
             )
         )
 
@@ -162,14 +193,14 @@ async def data(flow_function, db):
                 flow_id=f_2.id,
                 name="another-sad-duck",
                 tags=["red"],
-                state=states.Running(),
+                state=prefect.server.schemas.states.Running(),
             )
         )
-        fr_2_3 = await create_flow_run(
+        await create_flow_run(
             flow_run=core.FlowRun(
                 flow_id=f_2.id,
                 tags=["db", "red"],
-                state=states.Failed(),
+                state=prefect.server.schemas.states.Failed(),
             )
         )
 
@@ -179,17 +210,19 @@ async def data(flow_function, db):
             flow_run=core.FlowRun(
                 flow_id=f_3.id,
                 tags=[],
-                state=states.Completed(),
+                state=prefect.server.schemas.states.Completed(),
                 deployment_id=d_3_1.id,
                 work_queue_id=wp.default_queue_id,
             )
         )
 
-        fr_3_2 = await create_flow_run(
+        await create_flow_run(
             flow_run=core.FlowRun(
                 flow_id=f_3.id,
                 tags=["db", "red"],
-                state=states.Scheduled(scheduled_time=pendulum.now()),
+                state=prefect.server.schemas.states.Scheduled(
+                    scheduled_time=pendulum.now("UTC")
+                ),
             )
         )
 
@@ -209,7 +242,7 @@ async def data(flow_function, db):
                 flow_run_id=fr_1_1.id,
                 name="task-run-2",
                 task_key="b",
-                state=states.Completed(),
+                state=prefect.server.schemas.states.Completed(),
                 dynamic_key="0",
             )
         )
@@ -218,7 +251,7 @@ async def data(flow_function, db):
                 name="task-run-2a",
                 flow_run_id=fr_1_1.id,
                 task_key="c",
-                state=states.Completed(),
+                state=prefect.server.schemas.states.Completed(),
                 dynamic_key="0",
             )
         )
@@ -227,7 +260,7 @@ async def data(flow_function, db):
             task_run=core.TaskRun(
                 flow_run_id=fr_2_2.id,
                 task_key="a",
-                state=states.Running(),
+                state=prefect.server.schemas.states.Running(),
                 dynamic_key="0",
             )
         )
@@ -235,7 +268,7 @@ async def data(flow_function, db):
             task_run=core.TaskRun(
                 flow_run_id=fr_2_2.id,
                 task_key="b",
-                state=states.Completed(),
+                state=prefect.server.schemas.states.Completed(),
                 dynamic_key="0",
             )
         )
@@ -243,7 +276,7 @@ async def data(flow_function, db):
             task_run=core.TaskRun(
                 flow_run_id=fr_2_2.id,
                 task_key="c",
-                state=states.Completed(),
+                state=prefect.server.schemas.states.Completed(),
                 dynamic_key="0",
             )
         )
@@ -252,7 +285,7 @@ async def data(flow_function, db):
             task_run=core.TaskRun(
                 flow_run_id=fr_3_1.id,
                 task_key="a",
-                state=states.Failed(),
+                state=prefect.server.schemas.states.Failed(),
                 dynamic_key="0",
             )
         )
@@ -264,7 +297,7 @@ async def data(flow_function, db):
         fr1 = await create_flow_run(
             flow_run=core.FlowRun(flow_id=f_4.id),
         )
-        tr1 = await create_task_run(
+        await create_task_run(
             task_run=core.TaskRun(flow_run_id=fr1.id, task_key="a", dynamic_key="0")
         )
         tr2 = await create_task_run(
@@ -275,7 +308,7 @@ async def data(flow_function, db):
         fr2 = await create_flow_run(
             flow_run=core.FlowRun(flow_id=f_4.id, parent_task_run_id=tr2.id),
         )
-        tr3 = await create_task_run(
+        await create_task_run(
             task_run=core.TaskRun(flow_run_id=fr2.id, task_key="a", dynamic_key="0")
         )
 
@@ -405,31 +438,21 @@ class TestCountFlowsModels:
     async def test_api_count(self, client, kwargs, expected):
         adjusted_kwargs = adjust_kwargs_for_client(kwargs)
 
-        repsonse = await client.post(
+        response = await client.post(
             "/flows/count",
-            json=json.loads(
-                json.dumps(
-                    adjusted_kwargs,
-                    default=pydantic.json.pydantic_encoder,
-                )
-            ),
+            json=adjusted_kwargs,
         )
-        assert repsonse.json() == expected
+        assert response.json() == expected
 
     @pytest.mark.parametrize("kwargs,expected", params)
     async def test_api_read(self, client, kwargs, expected):
         adjusted_kwargs = adjust_kwargs_for_client(kwargs)
 
-        repsonse = await client.post(
+        response = await client.post(
             "/flows/filter",
-            json=json.loads(
-                json.dumps(
-                    adjusted_kwargs,
-                    default=pydantic.json.pydantic_encoder,
-                )
-            ),
+            json=adjusted_kwargs,
         )
-        assert len({r["id"] for r in repsonse.json()}) == expected
+        assert len({r["id"] for r in response.json()}) == expected
 
 
 class TestCountFlowRunModels:
@@ -628,28 +651,18 @@ class TestCountFlowRunModels:
     async def test_api_count(self, client, kwargs, expected):
         adjusted_kwargs = adjust_kwargs_for_client(kwargs)
 
-        repsonse = await client.post(
-            "/flow_runs/count",
-            json=json.loads(
-                json.dumps(adjusted_kwargs, default=pydantic.json.pydantic_encoder)
-            ),
-        )
-        assert repsonse.json() == expected
+        response = await client.post("/flow_runs/count", json=adjusted_kwargs)
+        assert response.json() == expected
 
     @pytest.mark.parametrize("kwargs,expected", params)
     async def test_api_read(self, client, kwargs, expected):
         adjusted_kwargs = adjust_kwargs_for_client(kwargs)
 
-        repsonse = await client.post(
+        response = await client.post(
             "/flow_runs/filter",
-            json=json.loads(
-                json.dumps(
-                    adjusted_kwargs,
-                    default=pydantic.json.pydantic_encoder,
-                )
-            ),
+            json=adjusted_kwargs,
         )
-        assert len({r["id"] for r in repsonse.json()}) == expected
+        assert len({r["id"] for r in response.json()}) == expected
 
 
 class TestCountTaskRunsModels:
@@ -791,28 +804,21 @@ class TestCountTaskRunsModels:
     @pytest.mark.parametrize("kwargs,expected", params)
     async def test_api_count(self, client, kwargs, expected):
         adjusted_kwargs = adjust_kwargs_for_client(kwargs)
-        repsonse = await client.post(
+        response = await client.post(
             "/task_runs/count",
-            json=json.loads(
-                json.dumps(adjusted_kwargs, default=pydantic.json.pydantic_encoder)
-            ),
+            json=adjusted_kwargs,
         )
-        assert repsonse.json() == expected
+        assert response.json() == expected
 
     @pytest.mark.parametrize("kwargs,expected", params)
     async def test_api_read(self, client, kwargs, expected):
         adjusted_kwargs = adjust_kwargs_for_client(kwargs)
 
-        repsonse = await client.post(
+        response = await client.post(
             "/task_runs/filter",
-            json=json.loads(
-                json.dumps(
-                    adjusted_kwargs,
-                    default=pydantic.json.pydantic_encoder,
-                )
-            ),
+            json=adjusted_kwargs,
         )
-        assert len({r["id"] for r in repsonse.json()}) == expected
+        assert len({r["id"] for r in response.json()}) == expected
 
 
 class TestCountDeploymentModels:
@@ -969,28 +975,19 @@ class TestCountDeploymentModels:
     async def test_api_count(self, client, kwargs, expected):
         adjusted_kwargs = adjust_kwargs_for_client(kwargs)
 
-        repsonse = await client.post(
+        response = await client.post(
             "/deployments/count",
-            json=json.loads(
-                json.dumps(
-                    adjusted_kwargs,
-                    default=pydantic.json.pydantic_encoder,
-                )
-            ),
+            json=adjusted_kwargs,
         )
-        assert repsonse.json() == expected
+
+        assert response.json() == expected
 
     @pytest.mark.parametrize("kwargs,expected", params)
     async def test_api_read(self, client, kwargs, expected):
         adjusted_kwargs = adjust_kwargs_for_client(kwargs)
 
-        repsonse = await client.post(
+        response = await client.post(
             "/deployments/filter",
-            json=json.loads(
-                json.dumps(
-                    adjusted_kwargs,
-                    default=pydantic.json.pydantic_encoder,
-                )
-            ),
+            json=adjusted_kwargs,
         )
-        assert len({r["id"] for r in repsonse.json()}) == expected
+        assert len({r["id"] for r in response.json()}) == expected

@@ -7,9 +7,10 @@ import sqlalchemy as sa
 from pydantic import SecretBytes, SecretStr
 
 from prefect.blocks.core import Block
-from prefect.blocks.fields import SecretDict
 from prefect.server import models, schemas
+from prefect.server.database import orm_models
 from prefect.server.schemas.actions import BlockDocumentCreate
+from prefect.types import SecretDict
 from prefect.utilities.names import obfuscate, obfuscate_string
 
 
@@ -223,7 +224,7 @@ class TestCreateBlockDocument:
         )
 
         before_count = await session.execute(
-            sa.select(sa.func.count()).select_from(db.BlockDocument)
+            sa.select(sa.func.count()).select_from(orm_models.BlockDocument)
         )
         await models.block_documents.create_block_document(
             session=session, block_document=block_document
@@ -237,7 +238,7 @@ class TestCreateBlockDocument:
         await session.rollback()
 
         after_count = await session.execute(
-            sa.select(sa.func.count()).select_from(db.BlockDocument)
+            sa.select(sa.func.count()).select_from(orm_models.BlockDocument)
         )
 
         # only one block created
@@ -814,6 +815,28 @@ class TestReadBlockDocuments:
             b.id for b in block_documents if not b.is_anonymous
         ]
 
+    async def test_read_block_documents_sorts_by_block_type_name_name(
+        self, session, block_documents
+    ):
+        sorted_blocks = sorted(
+            block_documents, key=lambda b: (b.block_type.name, b.name)
+        )
+
+        read_blocks = await models.block_documents.read_block_documents(
+            session=session,
+            sort=schemas.sorting.BlockDocumentSort.BLOCK_TYPE_AND_NAME_ASC,
+        )
+
+        # by default, exclude anonymous block documents
+        assert {b.id for b in read_blocks} == {
+            b.id for b in sorted_blocks if not b.is_anonymous
+        }
+
+        # sorted by block document name
+        assert [rb.id for rb in read_blocks] == [
+            b.id for b in sorted_blocks if not b.is_anonymous
+        ]
+
     async def test_read_block_documents_with_is_anonymous_filter(
         self, session, block_documents
     ):
@@ -900,6 +923,138 @@ class TestReadBlockDocuments:
         )
         assert len(swim_block_documents) == 1
         assert [b.id for b in swim_block_documents] == [block_documents[6].id]
+
+
+class TestCountBlockDocuments:
+    @pytest.fixture(autouse=True)
+    async def block_documents(self, session, block_schemas):
+        block_documents = []
+        block_documents.append(
+            await models.block_documents.create_block_document(
+                session=session,
+                block_document=schemas.actions.BlockDocumentCreate(
+                    block_schema_id=block_schemas[0].id,
+                    name="block-1",
+                    block_type_id=block_schemas[0].block_type_id,
+                ),
+            )
+        )
+        block_documents.append(
+            await models.block_documents.create_block_document(
+                session=session,
+                block_document=schemas.actions.BlockDocumentCreate(
+                    block_schema_id=block_schemas[1].id,
+                    name="block-2",
+                    block_type_id=block_schemas[1].block_type_id,
+                    data={"x": 1},
+                ),
+            )
+        )
+        block_documents.append(
+            await models.block_documents.create_block_document(
+                session=session,
+                block_document=schemas.actions.BlockDocumentCreate(
+                    block_schema_id=block_schemas[2].id,
+                    name="block-3",
+                    block_type_id=block_schemas[2].block_type_id,
+                    data={"y": 2},
+                ),
+            )
+        )
+        block_documents.append(
+            await models.block_documents.create_block_document(
+                session=session,
+                block_document=schemas.actions.BlockDocumentCreate(
+                    block_schema_id=block_schemas[1].id,
+                    name="block-4",
+                    block_type_id=block_schemas[1].block_type_id,
+                ),
+            )
+        )
+        block_documents.append(
+            await models.block_documents.create_block_document(
+                session=session,
+                block_document=schemas.actions.BlockDocumentCreate(
+                    block_schema_id=block_schemas[2].id,
+                    name="block-5",
+                    block_type_id=block_schemas[2].block_type_id,
+                ),
+            )
+        )
+        block_documents.append(
+            await models.block_documents.create_block_document(
+                session=session,
+                block_document=schemas.actions.BlockDocumentCreate(
+                    block_schema_id=block_schemas[2].id,
+                    block_type_id=block_schemas[2].block_type_id,
+                    is_anonymous=True,
+                ),
+            )
+        )
+
+        block_documents.append(
+            await models.block_documents.create_block_document(
+                session=session,
+                block_document=schemas.actions.BlockDocumentCreate(
+                    name="nested-block-1",
+                    block_schema_id=block_schemas[3].id,
+                    block_type_id=block_schemas[3].block_type_id,
+                    data={
+                        "b": {"$ref": {"block_document_id": block_documents[1].id}},
+                        "z": "index",
+                    },
+                ),
+            )
+        )
+
+        block_documents.append(
+            await models.block_documents.create_block_document(
+                session=session,
+                block_document=schemas.actions.BlockDocumentCreate(
+                    name="nested-block-2",
+                    block_schema_id=block_schemas[4].id,
+                    block_type_id=block_schemas[4].block_type_id,
+                    data={
+                        "c": {"$ref": {"block_document_id": block_documents[2].id}},
+                        "d": {"$ref": {"block_document_id": block_documents[5].id}},
+                    },
+                ),
+            )
+        )
+
+        await session.commit()
+        return sorted(block_documents, key=lambda b: b.name)
+
+    async def test_count_block_documents(self, session, block_documents):
+        read_blocks_count = await models.block_documents.count_block_documents(
+            session=session,
+        )
+
+        # by default, exclude anonymous block documents
+        assert read_blocks_count == len(
+            [b.id for b in block_documents if not b.is_anonymous]
+        )
+
+    async def test_count_block_documents_filter_capabilities(
+        self, session, block_documents
+    ):
+        fly_and_swim_block_documents_count = (
+            await models.block_documents.count_block_documents(
+                session=session,
+                block_schema_filter=schemas.filters.BlockSchemaFilter(
+                    block_capabilities=dict(all_=["fly", "swim"])
+                ),
+            )
+        )
+        assert fly_and_swim_block_documents_count == 1
+
+        fly_block_documents_count = await models.block_documents.count_block_documents(
+            session=session,
+            block_schema_filter=schemas.filters.BlockSchemaFilter(
+                block_capabilities=dict(all_=["fly"])
+            ),
+        )
+        fly_block_documents_count == 3
 
 
 class TestDeleteBlockDocument:
@@ -1426,18 +1581,18 @@ class TestUpdateBlockDocument:
 class TestSecretBlockDocuments:
     @pytest.fixture()
     async def secret_block_type_and_schema(self, session):
-        class SecretBlock(Block):
+        class SecretBlockC(Block):
             w: SecretDict
             x: SecretStr
             y: SecretBytes
             z: str
 
         secret_block_type = await models.block_types.create_block_type(
-            session=session, block_type=SecretBlock._to_block_type()
+            session=session, block_type=SecretBlockC._to_block_type()
         )
         secret_block_schema = await models.block_schemas.create_block_schema(
             session=session,
-            block_schema=SecretBlock._to_block_schema(
+            block_schema=SecretBlockC._to_block_schema(
                 block_type_id=secret_block_type.id
             ),
         )

@@ -1,19 +1,30 @@
+import json
 import os
 import socket
 import sys
 from contextlib import contextmanager
-from typing import AsyncGenerator, List, Optional, Union
+from typing import AsyncGenerator, Generator, List, Optional, Union
+from unittest import mock
 from uuid import UUID
 
 import anyio
 import httpx
 import pendulum
 import pytest
+from starlette.status import WS_1008_POLICY_VIOLATION
 from websockets.exceptions import ConnectionClosed
 from websockets.legacy.server import WebSocketServer, WebSocketServerProtocol, serve
 
 from prefect.events import Event
-from prefect.settings import PREFECT_API_URL, get_current_settings, temporary_settings
+from prefect.events.clients import AssertingEventsClient
+from prefect.events.filters import EventFilter
+from prefect.events.worker import EventsWorker
+from prefect.settings import (
+    PREFECT_API_URL,
+    PREFECT_SERVER_CSRF_PROTECTION_ENABLED,
+    get_current_settings,
+    temporary_settings,
+)
 from prefect.testing.utilities import AsyncMock
 from prefect.utilities.processutils import open_process
 
@@ -64,7 +75,10 @@ async def hosted_api_server(unused_tcp_port_factory):
         ],
         stdout=sys.stdout,
         stderr=sys.stderr,
-        env={**os.environ, **get_current_settings().to_environment_variables()},
+        env={
+            **os.environ,
+            **get_current_settings().to_environment_variables(exclude_unset=True),
+        },
     ) as process:
         api_url = f"http://localhost:{port}/api"
 
@@ -113,7 +127,12 @@ def use_hosted_api_server(hosted_api_server):
     """
     Sets `PREFECT_API_URL` to the test session's hosted API endpoint.
     """
-    with temporary_settings({PREFECT_API_URL: hosted_api_server}):
+    with temporary_settings(
+        {
+            PREFECT_API_URL: hosted_api_server,
+            PREFECT_SERVER_CSRF_PROTECTION_ENABLED: False,
+        }
+    ):
         yield hosted_api_server
 
 
@@ -123,7 +142,7 @@ def mock_anyio_sleep(monkeypatch):
     Mock sleep used to not actually sleep but to set the current time to now + sleep
     delay seconds while still yielding to other tasks in the event loop.
 
-    Provides "assert_sleeps_for" context manager which asserts a sleep time occured
+    Provides "assert_sleeps_for" context manager which asserts a sleep time occurred
     within the context while using the actual runtime of the context as a tolerance.
     """
     original_now = pendulum.now
@@ -193,6 +212,8 @@ class Recorder:
     connections: int
     path: Optional[str]
     events: List[Event]
+    token: Optional[str]
+    filter: Optional[EventFilter]
 
     def __init__(self):
         self.connections = 0
@@ -201,12 +222,19 @@ class Recorder:
 
 
 class Puppeteer:
+    token: Optional[str]
+
+    hard_auth_failure: bool
     refuse_any_further_connections: bool
     hard_disconnect_after: Optional[UUID]
 
+    outgoing_events: List[Event]
+
     def __init__(self):
+        self.hard_auth_failure = False
         self.refuse_any_further_connections = False
         self.hard_disconnect_after = None
+        self.outgoing_events = []
 
 
 @pytest.fixture
@@ -232,16 +260,57 @@ async def events_server(
 
         recorder.path = path
 
+        if path.endswith("/events/in"):
+            await incoming_events(socket)
+        elif path.endswith("/events/out"):
+            await outgoing_events(socket)
+
+    async def incoming_events(socket: WebSocketServerProtocol):
         while True:
             try:
                 message = await socket.recv()
             except ConnectionClosed:
                 return
 
-            event = Event.parse_raw(message)
+            event = Event.model_validate_json(message)
             recorder.events.append(event)
 
             if puppeteer.hard_disconnect_after == event.id:
+                raise ValueError("zonk")
+
+    async def outgoing_events(socket: WebSocketServerProtocol):
+        # 1. authentication
+        auth_message = json.loads(await socket.recv())
+
+        assert auth_message["type"] == "auth"
+        recorder.token = auth_message["token"]
+        if puppeteer.token != recorder.token:
+            if not puppeteer.hard_auth_failure:
+                await socket.send(
+                    json.dumps({"type": "auth_failure", "reason": "nope"})
+                )
+            await socket.close(WS_1008_POLICY_VIOLATION)
+            return
+
+        await socket.send(json.dumps({"type": "auth_success"}))
+
+        # 2. filter
+        filter_message = json.loads(await socket.recv())
+        assert filter_message["type"] == "filter"
+        recorder.filter = EventFilter.model_validate(filter_message["filter"])
+
+        # 3. send events
+        for event in puppeteer.outgoing_events:
+            await socket.send(
+                json.dumps(
+                    {
+                        "type": "event",
+                        "event": event.model_dump(mode="json"),
+                    }
+                )
+            )
+            if puppeteer.hard_disconnect_after == event.id:
+                puppeteer.hard_disconnect_after = None
                 raise ValueError("zonk")
 
     async with serve(handler, host="localhost", port=unused_tcp_port) as server:
@@ -250,4 +319,35 @@ async def events_server(
 
 @pytest.fixture
 def events_api_url(events_server: WebSocketServer, unused_tcp_port: int) -> str:
+    return f"http://localhost:{unused_tcp_port}"
+
+
+@pytest.fixture
+def events_cloud_api_url(events_server: WebSocketServer, unused_tcp_port: int) -> str:
     return f"http://localhost:{unused_tcp_port}/accounts/A/workspaces/W"
+
+
+@pytest.fixture
+def mock_should_emit_events(monkeypatch) -> mock.Mock:
+    m = mock.Mock()
+    m.return_value = True
+    monkeypatch.setattr("prefect.events.utilities.should_emit_events", m)
+    return m
+
+
+@pytest.fixture
+def asserting_events_worker(monkeypatch) -> Generator[EventsWorker, None, None]:
+    worker = EventsWorker.instance(AssertingEventsClient)
+    # Always yield the asserting worker when new instances are retrieved
+    monkeypatch.setattr(EventsWorker, "instance", lambda *_: worker)
+    try:
+        yield worker
+    finally:
+        worker.drain()
+
+
+@pytest.fixture
+def reset_worker_events(asserting_events_worker: EventsWorker):
+    yield
+    assert isinstance(asserting_events_worker._client, AssertingEventsClient)
+    asserting_events_worker._client.events = []

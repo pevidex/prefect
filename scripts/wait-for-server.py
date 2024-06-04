@@ -13,17 +13,18 @@ Example:
     PREFECT_API_URL="http://localhost:4200" ./scripts/wait-for-server.py
 """
 
-DEFAULT_TIMEOUT_SECONDS = 120
 
 import sys
 
 import anyio
 
-from prefect import get_client
+from prefect.client.orchestration import get_client
+
+DEFAULT_TIMEOUT_SECONDS = 120
 
 
 async def main(timeout):
-    async with anyio.move_on_after(timeout):
+    with anyio.move_on_after(timeout):
         print("Retrieving client...")
         async with get_client() as client:
             print("Connecting", end="")

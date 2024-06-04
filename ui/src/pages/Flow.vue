@@ -1,35 +1,33 @@
 <template>
-  <p-layout-well class="flow">
+  <p-layout-default class="flow">
     <template #header>
       <PageHeadingFlow v-if="flow" :flow="flow" @delete="deleteFlow" />
     </template>
 
-    <p-tabs :tabs="tabs">
+    <FlowStats v-if="flow" :flow-id="flow.id" />
+
+    <p-tabs v-model:selected="tab" :tabs="tabs">
       <template #details>
         <FlowDetails v-if="flow" :flow="flow" />
       </template>
 
       <template #deployments>
-        <DeploymentsTable :filter="deploymentsFilter" />
+        <DeploymentList :filter="deploymentsFilter" prefix="deployments" />
       </template>
 
       <template #runs>
-        <FlowRunFilteredList :flow-run-filter="flowRunsFilter" />
+        <FlowRunFilteredList :filter="flowRunsFilter" selectable prefix="runs" />
       </template>
     </p-tabs>
-
-    <template #well>
-      <FlowDetails v-if="flow" :flow="flow" />
-    </template>
-  </p-layout-well>
+  </p-layout-default>
 </template>
 
 <script lang="ts" setup>
-  import { media } from '@prefecthq/prefect-design'
-  import { DeploymentsTable, PageHeadingFlow, FlowDetails, FlowRunFilteredList, useWorkspaceApi, useFlowRunsFilter, useDeploymentsFilter } from '@prefecthq/prefect-ui-library'
-  import { useSubscription, useRouteParam } from '@prefecthq/vue-compositions'
+  import { DeploymentList, PageHeadingFlow, FlowDetails, FlowRunFilteredList, useWorkspaceApi, useFlowRunsFilter, useDeploymentsFilter } from '@prefecthq/prefect-ui-library'
+  import { useSubscription, useRouteParam, useRouteQueryParam } from '@prefecthq/vue-compositions'
   import { computed } from 'vue'
   import { useRouter } from 'vue-router'
+  import FlowStats from '@/components/FlowStats.vue'
   import { usePageTitle } from '@/compositions/usePageTitle'
   import { routes } from '@/router/routes'
 
@@ -37,15 +35,8 @@
   const flowId = useRouteParam('flowId')
   const flowIds = computed(() => [flowId.value])
   const router = useRouter()
-  const tabs = computed(() => {
-    const values = ['Runs', 'Deployments']
-
-    if (!media.xl) {
-      values.unshift('Details')
-    }
-
-    return values
-  })
+  const tab = useRouteQueryParam('tab', 'Runs')
+  const tabs = ['Runs', 'Deployments', 'Details']
 
   const subscriptionOptions = {
     interval: 300000,

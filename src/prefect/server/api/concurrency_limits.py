@@ -1,6 +1,7 @@
 """
 Routes for interacting with concurrency limit objects.
 """
+
 from typing import List, Optional
 from uuid import UUID
 
@@ -24,14 +25,16 @@ async def create_concurrency_limit(
     db: PrefectDBInterface = Depends(provide_database_interface),
 ) -> schemas.core.ConcurrencyLimit:
     # hydrate the input model into a full model
-    concurrency_limit_model = schemas.core.ConcurrencyLimit(**concurrency_limit.dict())
+    concurrency_limit_model = schemas.core.ConcurrencyLimit(
+        **concurrency_limit.model_dump()
+    )
 
     async with db.session_context(begin_transaction=True) as session:
         model = await models.concurrency_limits.create_concurrency_limit(
             session=session, concurrency_limit=concurrency_limit_model
         )
 
-    if model.created >= pendulum.now():
+    if model.created >= pendulum.now("UTC"):
         response.status_code = status.HTTP_201_CREATED
 
     return model

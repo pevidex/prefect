@@ -21,7 +21,6 @@ from prefect.server.schemas.filters import (
     VariableFilterId,
     VariableFilterName,
     VariableFilterTags,
-    VariableFilterValue,
 )
 from prefect.server.schemas.sorting import VariableSort
 
@@ -78,6 +77,29 @@ class TestCreateVariable:
         assert model.name == variable.name
         assert model.value == variable.value
         assert model.tags == variable.tags
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "string-value",
+            '"string-value"',
+            123,
+            12.3,
+            True,
+            False,
+            None,
+            {"key": "value"},
+            ["value1", "value2"],
+            {"key": ["value1", "value2"]},
+        ],
+    )
+    async def test_create_variable_json_types(self, session, value):
+        variable = VariableCreate(name="my_variable", value=value, tags=["123", "456"])
+        model = await create_variable(session, variable)
+        await session.commit()
+        assert model
+        assert model.id
+        assert model.value == variable.value == value
 
     async def test_create_variable_name_unique(
         self,
@@ -167,30 +189,6 @@ class TestReadVariables:
         assert len(res) == 2
         assert {r.id for r in res} == {v.id for v in variables if "variable1" in v.name}
 
-    async def test_filter_by_any_value(
-        self,
-        session,
-        variables,
-    ):
-        res = await read_variables(
-            session,
-            variable_filter=VariableFilter(value=VariableFilterValue(any_=["value1"])),
-        )
-        assert len(res) == 1
-        assert {r.id for r in res} == {v.id for v in variables if "value1" == v.value}
-
-    async def test_filter_by_like_value(
-        self,
-        session,
-        variables,
-    ):
-        res = await read_variables(
-            session,
-            variable_filter=VariableFilter(value=VariableFilterValue(like_="value1%")),
-        )
-        assert len(res) == 2
-        assert {r.id for r in res} == {v.id for v in variables if "value1" in v.value}
-
     async def test_filter_by_tag(
         self,
         session,
@@ -260,7 +258,9 @@ class TestUpdateVariable:
     ):
         new_name = "another_name"
         updated = await update_variable(
-            session, variable.id, VariableUpdate(name=new_name)  # type: ignore
+            session,
+            variable.id,
+            VariableUpdate(name=new_name),  # type: ignore
         )
         assert updated
 
@@ -275,7 +275,9 @@ class TestUpdateVariable:
     ):
         new_value = "another_name"
         updated = await update_variable(
-            session, variable.id, VariableUpdate(value=new_value)  # type: ignore
+            session,
+            variable.id,
+            VariableUpdate(value=new_value),  # type: ignore
         )
         assert updated
 
@@ -290,7 +292,9 @@ class TestUpdateVariable:
     ):
         new_tags = ["new-tag-123"]
         updated = await update_variable(
-            session, variable.id, VariableUpdate(tags=new_tags)  # type: ignore
+            session,
+            variable.id,
+            VariableUpdate(tags=new_tags),  # type: ignore
         )
         assert updated
 

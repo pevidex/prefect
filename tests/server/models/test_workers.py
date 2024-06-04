@@ -5,7 +5,6 @@ import pydantic
 import pytest
 import sqlalchemy as sa
 
-import prefect
 from prefect.server import models, schemas
 
 
@@ -41,7 +40,9 @@ class TestCreateWorkPool:
 
     @pytest.mark.parametrize("name", ["hi/there", "hi%there"])
     async def test_create_invalid_name(self, session, name):
-        with pytest.raises(pydantic.ValidationError, match="(invalid character)"):
+        with pytest.raises(
+            pydantic.ValidationError, match="String should match pattern"
+        ):
             schemas.core.WorkPool(name=name)
 
     @pytest.mark.parametrize("type", ["PROCESS", "K8S", "AGENT"])
@@ -146,6 +147,7 @@ class TestUpdateWorkPool:
             work_pool=schemas.actions.WorkPoolUpdate(
                 is_paused=True, concurrency_limit=5
             ),
+            emit_status_change=None,
         )
 
         result = await models.workers.read_work_pool(
@@ -160,6 +162,7 @@ class TestUpdateWorkPool:
                 session=session,
                 work_pool_id=work_pool.id,
                 work_pool=schemas.actions.WorkPoolUpdate(concurrency_limit=-5),
+                emit_status_change=None,
             )
 
     async def test_update_work_pool_zero_concurrency(self, session, work_pool):
@@ -167,6 +170,7 @@ class TestUpdateWorkPool:
             session=session,
             work_pool_id=work_pool.id,
             work_pool=schemas.actions.WorkPoolUpdate(concurrency_limit=0),
+            emit_status_change=None,
         )
         result = await models.workers.read_work_pool(
             session=session, work_pool_id=work_pool.id
@@ -182,6 +186,25 @@ class TestReadWorkPool:
         assert result.name == work_pool.name
         assert result.is_paused is work_pool.is_paused
         assert result.concurrency_limit == work_pool.concurrency_limit
+
+
+class TestCountWorkPools:
+    async def test_count_work_pool(self, session, work_pool):
+        result = await models.workers.count_work_pools(
+            session=session,
+        )
+        assert result == 1
+
+        random_name = "not-my-work-pool"
+        assert random_name != work_pool.name
+
+        filtered_result = await models.workers.count_work_pools(
+            session=session,
+            work_pool_filter=schemas.filters.WorkPoolFilter(
+                name={"any_": [random_name]}
+            ),
+        )
+        assert filtered_result == 0
 
 
 class TestDeleteWorkPool:
@@ -277,7 +300,9 @@ class TestCreateWorkQueue:
 
     @pytest.mark.parametrize("name", ["hi/there", "hi%there"])
     async def test_create_invalid_name(self, session, work_pool, name):
-        with pytest.raises(pydantic.ValidationError, match="(invalid character)"):
+        with pytest.raises(
+            pydantic.ValidationError, match="String should match pattern"
+        ):
             schemas.actions.WorkQueueCreate(name=name)
 
 
@@ -336,8 +361,8 @@ class TestReadWorkQueues:
         assert len(result) == 4
         assert (result[0].name, result[0].priority) == ("default", 1)
         assert (result[1].name, result[1].priority) == ("C", 2)
-        assert (result[2].name, result[2].priority) == ("B", 3)
-        assert (result[3].name, result[3].priority) == ("A", 4)
+        assert (result[2].name, result[2].priority) == ("B", 4)
+        assert (result[3].name, result[3].priority) == ("A", 100)
 
 
 class TestUpdateWorkQueue:
@@ -374,19 +399,6 @@ class TestUpdateWorkQueue:
             session=session, work_queue_id=work_queue.id
         )
         assert result.concurrency_limit == 0
-
-    async def test_update_work_queue_priority_is_normalized_for_number_of_queues(
-        self, session, work_queue_1
-    ):
-        assert await models.workers.update_work_queue(
-            session=session,
-            work_queue_id=work_queue_1.id,
-            work_queue=schemas.actions.WorkQueueUpdate(priority=100),
-        )
-        result = await models.workers.read_work_queue(
-            session=session, work_queue_id=work_queue_1.id
-        )
-        assert result.priority == 2
 
 
 class TestUpdateWorkQueuePriorities:
@@ -517,8 +529,8 @@ class TestUpdateWorkQueuePriorities:
         assert {q.name: q.priority for q in all_queues} == {
             "A": 1,
             "B": 2,
-            "D": 3,
-            "E": 4,
+            "D": 4,
+            "E": 5,
         }
 
 
@@ -540,7 +552,7 @@ class TestDeleteWorkQueue:
         )
 
     async def test_delete_queue_updates_priorities(self, session, work_pool):
-        result_1 = await models.workers.create_work_queue(
+        await models.workers.create_work_queue(
             session=session,
             work_pool_id=work_pool.id,
             work_queue=schemas.actions.WorkQueueCreate(name="A"),
@@ -550,7 +562,7 @@ class TestDeleteWorkQueue:
             work_pool_id=work_pool.id,
             work_queue=schemas.actions.WorkQueueCreate(name="B"),
         )
-        result_3 = await models.workers.create_work_queue(
+        await models.workers.create_work_queue(
             session=session,
             work_pool_id=work_pool.id,
             work_queue=schemas.actions.WorkQueueCreate(name="C"),
@@ -569,7 +581,7 @@ class TestDeleteWorkQueue:
         assert len(result) == 3
         assert (result[0].name, result[0].priority) == ("default", 1)
         assert (result[1].name, result[1].priority) == ("A", 2)
-        assert (result[2].name, result[2].priority) == ("C", 3)
+        assert (result[2].name, result[2].priority) == ("C", 4)
 
 
 class TestWorkerHeartbeat:
@@ -710,7 +722,7 @@ class TestGetScheduledRuns:
                 session=session,
                 flow_run=schemas.core.FlowRun(
                     flow_id=flow.id,
-                    state=prefect.states.Running(),
+                    state=schemas.states.Running(),
                     work_queue_id=wq.id,
                 ),
             )
@@ -720,7 +732,7 @@ class TestGetScheduledRuns:
                 session=session,
                 flow_run=schemas.core.FlowRun(
                     flow_id=flow.id,
-                    state=prefect.states.Pending(),
+                    state=schemas.states.Pending(),
                     work_queue_id=wq.id,
                 ),
             )
@@ -733,8 +745,8 @@ class TestGetScheduledRuns:
                     session=session,
                     flow_run=schemas.core.FlowRun(
                         flow_id=flow.id,
-                        state=prefect.states.Scheduled(
-                            scheduled_time=pendulum.now().add(hours=i)
+                        state=schemas.states.Scheduled(
+                            scheduled_time=pendulum.now("UTC").add(hours=i)
                         ),
                         work_queue_id=wq.id,
                     ),
@@ -786,13 +798,13 @@ class TestGetScheduledRuns:
 
     async def test_get_all_runs_scheduled_before(self, session):
         runs = await models.workers.get_scheduled_flow_runs(
-            session=session, scheduled_before=pendulum.now()
+            session=session, scheduled_before=pendulum.now("UTC")
         )
         assert len(runs) == 18
 
     async def test_get_all_runs_scheduled_after(self, session):
         runs = await models.workers.get_scheduled_flow_runs(
-            session=session, scheduled_after=pendulum.now()
+            session=session, scheduled_after=pendulum.now("UTC")
         )
         assert len(runs) == 27
 
@@ -847,3 +859,24 @@ class TestGetScheduledRuns:
             work_queue_ids=[work_queues["wq_aa"].id],
         )
         assert len(runs) == 0
+
+
+class TestDeleteWorker:
+    async def test_delete_worker(self, session, work_pool):
+        for i in range(3):
+            await models.workers.worker_heartbeat(
+                session=session, work_pool_id=work_pool.id, worker_name=f"worker.{i}"
+            )
+        await models.workers.delete_worker(
+            session=session, work_pool_id=work_pool.id, worker_name="worker.1"
+        )
+        remaining_workers = await models.workers.read_workers(
+            session=session, work_pool_id=work_pool.id
+        )
+        assert len(remaining_workers) == 2
+        assert "worker.1" not in map(lambda x: x.name, remaining_workers)
+
+    async def test_delete_nonexistent_worker(self, session, work_pool):
+        assert not await models.workers.delete_worker(
+            session=session, work_pool_id=work_pool.id, worker_name="worker.1"
+        )

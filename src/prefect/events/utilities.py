@@ -3,11 +3,16 @@ from typing import Any, Dict, List, Optional, Union
 from uuid import UUID
 
 import pendulum
+from pydantic_extra_types.pendulum_dt import DateTime
 
-from prefect.server.utilities.schemas import DateTimeTZ
-
-from .schemas import Event, RelatedResource
-from .worker import EventsWorker
+from .clients import (
+    AssertingEventsClient,
+    PrefectCloudEventsClient,
+    PrefectEphemeralEventsClient,
+    PrefectEventsClient,
+)
+from .schemas.events import Event, RelatedResource
+from .worker import EventsWorker, should_emit_events
 
 TIGHT_TIMING = timedelta(minutes=5)
 
@@ -15,12 +20,12 @@ TIGHT_TIMING = timedelta(minutes=5)
 def emit_event(
     event: str,
     resource: Dict[str, str],
-    occurred: Optional[DateTimeTZ] = None,
+    occurred: Optional[DateTime] = None,
     related: Optional[Union[List[Dict[str, str]], List[RelatedResource]]] = None,
     payload: Optional[Dict[str, Any]] = None,
     id: Optional[UUID] = None,
     follows: Optional[Event] = None,
-) -> Event:
+) -> Optional[Event]:
     """
     Send an event to Prefect Cloud.
 
@@ -38,15 +43,30 @@ def emit_event(
             relationship will not be set.
 
     Returns:
-        The event that was emitted.
+        The event that was emitted if worker is using a client that emit
+        events, otherwise None
     """
-    event_kwargs = {
+    if not should_emit_events():
+        return None
+
+    operational_clients = [
+        AssertingEventsClient,
+        PrefectCloudEventsClient,
+        PrefectEventsClient,
+        PrefectEphemeralEventsClient,
+    ]
+    worker_instance = EventsWorker.instance()
+
+    if worker_instance.client_type not in operational_clients:
+        return None
+
+    event_kwargs: Dict[str, Any] = {
         "event": event,
         "resource": resource,
     }
 
     if occurred is None:
-        occurred = pendulum.now()
+        occurred = pendulum.now("UTC")
     event_kwargs["occurred"] = occurred
 
     if related is not None:
@@ -63,6 +83,6 @@ def emit_event(
             event_kwargs["follows"] = follows.id
 
     event_obj = Event(**event_kwargs)
-    EventsWorker.instance().send(event_obj)
+    worker_instance.send(event_obj)
 
     return event_obj

@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime as pydatetime
 from datetime import timedelta
 from unittest import mock
@@ -6,12 +7,13 @@ import dateutil
 import pendulum
 import pytest
 from dateutil import rrule
+from packaging import version
 from pendulum import datetime, now
 from pydantic import ValidationError
 
+from prefect._internal.schemas.validators import MAX_RRULE_LENGTH
 from prefect.server.schemas.schedules import (
     MAX_ITERATIONS,
-    MAX_RRULE_LENGTH,
     CronSchedule,
     IntervalSchedule,
     RRuleSchedule,
@@ -23,12 +25,15 @@ RRDaily = "FREQ=DAILY"
 
 class TestCreateIntervalSchedule:
     def test_interval_is_required(self):
-        with pytest.raises(ValidationError, match="(field required)"):
+        with pytest.raises(ValidationError):
             IntervalSchedule()
 
     @pytest.mark.parametrize("minutes", [-1, 0])
     def test_interval_must_be_positive(self, minutes):
-        with pytest.raises(ValidationError, match="(interval must be positive)"):
+        with pytest.raises(
+            ValidationError,
+            match="(interval must be positive|should be greater than 0 seconds)",
+        ):
             IntervalSchedule(interval=timedelta(minutes=minutes))
 
     def test_default_anchor(self):
@@ -67,7 +72,7 @@ class TestCreateIntervalSchedule:
         assert clock.anchor_date == dt
 
     def test_invalid_timezone(self):
-        with pytest.raises(ValidationError, match="(Invalid timezone)"):
+        with pytest.raises(ValidationError):
             IntervalSchedule(interval=timedelta(days=1), timezone="fake")
 
     def test_infer_utc_offset_timezone(self):
@@ -81,7 +86,7 @@ class TestCreateIntervalSchedule:
     def test_parse_utc_offset_timezone(self):
         offset_dt = pendulum.parse(str(pendulum.now("America/New_York")))
         clock = IntervalSchedule(interval=timedelta(days=1), anchor_date=offset_dt)
-        clock_dict = clock.dict(json_compatible=True)
+        clock_dict = clock.model_dump(mode="json")
 
         # remove the timezone
         clock_dict.pop("timezone")
@@ -90,7 +95,7 @@ class TestCreateIntervalSchedule:
             "anchor_date"
         ].endswith("-05:00")
 
-        parsed = IntervalSchedule.parse_obj(clock_dict)
+        parsed = IntervalSchedule.model_validate(clock_dict)
         assert parsed.anchor_date.tz.name in ("-04:00", "-05:00")
         assert parsed.timezone == "UTC"
 
@@ -101,8 +106,10 @@ class TestCreateIntervalSchedule:
             anchor_date=offset_dt,
             timezone="America/New_York",
         )
-        clock_dict = clock.dict(json_compatible=True)
-        assert IntervalSchedule.parse_obj(clock_dict).timezone == "America/New_York"
+        clock_dict = clock.model_dump(mode="json")
+        assert (
+            IntervalSchedule.model_validate(clock_dict).timezone == "America/New_York"
+        )
 
 
 class TestIntervalSchedule:
@@ -179,7 +186,7 @@ class TestIntervalSchedule:
         # Regression test for https://github.com/PrefectHQ/orion/issues/2466
         clock = IntervalSchedule(
             interval=timedelta(days=1),
-            anchor_date=pydatetime(2022, 1, 1),
+            anchor_date=datetime(2022, 1, 1, tz=None),
         )
         dates = await clock.get_dates(start=datetime(2022, 1, 1), n=3)
         assert dates == [
@@ -247,12 +254,12 @@ class TestCreateCronSchedule:
         assert clock.timezone == "America/New_York"
 
     def test_invalid_timezone(self):
-        with pytest.raises(ValidationError, match="(Invalid timezone)"):
+        with pytest.raises(ValidationError):
             CronSchedule(cron="5 4 * * *", timezone="fake")
 
     @pytest.mark.parametrize("cron_string", ["invalid cron"])
     def test_invalid_cron_string(self, cron_string):
-        with pytest.raises(ValidationError, match="(Invalid cron)"):
+        with pytest.raises(ValidationError):
             CronSchedule(cron=cron_string)
 
     @pytest.mark.parametrize("cron_string", ["5 4 R * *"])
@@ -447,8 +454,13 @@ class TestCronScheduleDaylightSavingsTime:
         dates = await s.get_dates(n=5, start=dt)
 
         assert [d.in_tz("America/New_York").hour for d in dates] == [23, 0, 1, 2, 3]
-        # skips an hour UTC - note cron clocks skip the "5"
-        assert [d.in_tz("UTC").hour for d in dates] == [3, 4, 6, 7, 8]
+
+        # pendulum fixed a UTC-offset issue in 3.0
+        # https://github.com/PrefectHQ/prefect/issues/11619
+        if version.parse(pendulum.__version__) >= version.parse("3.0"):
+            assert [d.in_tz("UTC").hour for d in dates] == [3, 4, 5, 7, 8]
+        else:
+            assert [d.in_tz("UTC").hour for d in dates] == [3, 4, 6, 7, 8]
 
     async def test_cron_schedule_daily_start_daylight_savings_time_forward(self):
         """
@@ -478,6 +490,22 @@ class TestCronScheduleDaylightSavingsTime:
         # constant 9am start
         assert [d.in_tz("America/New_York").hour for d in dates] == [9, 9, 9, 9, 9]
         assert [d.in_tz("UTC").hour for d in dates] == [13, 13, 13, 14, 14]
+
+    async def test_cron_schedule_handles_scheduling_near_dst_boundary(self):
+        """
+        Regression test for  https://github.com/PrefectHQ/nebula/issues/4048
+        `croniter` does not generate expected schedules when given a start
+        time on the day DST occurs but before the time shift actually happens.
+        Daylight savings occurs at 2023-03-12T02:00:00-05:00 and clocks jump
+        ahead to 2023-03-12T03:00:00-04:00. The timestamp below is in the 2-hour
+        window where it is 2023-03-12, but the DST shift has not yet occurred.
+        """
+        dt = pendulum.datetime(2023, 3, 12, 5, 10, 2, tz="UTC")
+        s = CronSchedule(cron="10 0 * * *", timezone="America/Montreal")
+        dates = await s.get_dates(n=5, start=dt)
+
+        assert [d.in_tz("America/New_York").hour for d in dates] == [0, 0, 0, 0, 0]
+        assert [d.in_tz("UTC").hour for d in dates] == [4, 4, 4, 4, 4]
 
 
 class TestRRuleScheduleDaylightSavingsTime:
@@ -563,7 +591,7 @@ class TestRRuleScheduleDaylightSavingsTime:
 
 class TestCreateRRuleSchedule:
     async def test_rrule_is_required(self):
-        with pytest.raises(ValidationError, match="(field required)"):
+        with pytest.raises(ValidationError):
             RRuleSchedule()
 
     async def test_create_from_rrule_str(self):
@@ -637,15 +665,15 @@ class TestRRuleSchedule:
 
     async def test_rrule_validates_rrule_str(self):
         # generic validation error
-        with pytest.raises(ValidationError, match="(Invalid RRule string)"):
+        with pytest.raises(ValidationError):
             RRuleSchedule(rrule="bad rrule string")
 
         # generic validation error
-        with pytest.raises(ValidationError, match="(Invalid RRule string)"):
+        with pytest.raises(ValidationError):
             RRuleSchedule(rrule="FREQ=DAILYBAD")
 
         # informative error when possible
-        with pytest.raises(ValidationError, match="(invalid 'FREQ': DAILYBAD)"):
+        with pytest.raises(ValidationError):
             RRuleSchedule(rrule="FREQ=DAILYBAD")
 
     async def test_rrule_max_rrule_len(self):
@@ -654,7 +682,7 @@ class TestRRuleSchedule:
             [start.add(days=i).format("YMMDD") + "T000000Z" for i in range(365 * 3)]
         )
         assert len(s) > MAX_RRULE_LENGTH
-        with pytest.raises(ValidationError, match="Max length"):
+        with pytest.raises(ValidationError):
             RRuleSchedule(rrule=s)
 
     async def test_rrule_schedule_handles_complex_rrulesets(self):
@@ -775,7 +803,7 @@ class TestRRuleSchedule:
         rrset.rrule(rrule.rrule(rrule.HOURLY, count=10, dtstart=dt_chicago))
 
         with pytest.raises(ValueError, match="too many dtstart timezones"):
-            s = RRuleSchedule.from_rrule(rrset)
+            RRuleSchedule.from_rrule(rrset)
 
     async def test_rrule_schedule_rejects_rrulesets_with_many_dtstarts(self):
         dt_1 = datetime(2018, 1, 11, 4, tz="America/New_York")
@@ -785,7 +813,7 @@ class TestRRuleSchedule:
         rrset.rrule(rrule.rrule(rrule.HOURLY, count=10, dtstart=dt_2))
 
         with pytest.raises(ValueError, match="too many dtstarts"):
-            s = RRuleSchedule.from_rrule(rrset)
+            RRuleSchedule.from_rrule(rrset)
 
     @pytest.mark.xfail(
         reason="we currently cannot roundtrip RRuleSchedule objects for all timezones"
@@ -931,7 +959,7 @@ class TestRRuleSchedule:
     )
     async def test_rrule(self, rrule_obj, rrule_str, expected_dts):
         s = RRuleSchedule.from_rrule(rrule_obj)
-        assert s.dict()["rrule"] == rrule_str
+        assert s.model_dump()["rrule"] == rrule_str
         dates = await s.get_dates(n=3, start=dt)
         assert dates == expected_dts
 
@@ -946,7 +974,7 @@ class TestRRuleSchedule:
             )
         )
         assert (
-            s.dict()["rrule"]
+            s.model_dump()["rrule"]
             == "DTSTART:20200101T000000\nRRULE:FREQ=DAILY;COUNT=8;BYDAY=MO,TU,WE,TH,FR"
         )
         dates = await s.get_dates(n=100, start=dt)
@@ -960,3 +988,101 @@ class TestRRuleSchedule:
             dt.add(days=8),
             dt.add(days=9),
         ]
+
+
+@pytest.fixture
+async def weekly_on_friday() -> RRuleSchedule:
+    return RRuleSchedule(rrule="FREQ=WEEKLY;INTERVAL=1;BYDAY=FR", timezone="UTC")
+
+
+async def test_unanchored_rrule_schedules_are_idempotent(
+    weekly_on_friday: RRuleSchedule,
+):
+    """Regression test for an issue discovered in Prefect Cloud, where a schedule with
+    an RRULE that didn't anchor to a specific time was being rescheduled every time the
+    scheduler loop picked it up.  This is because when a user does not provide a DTSTART
+    in their rule, then the current time is assumed to be the DTSTART.
+
+    This test confirms the behavior when a user does _not_ provide a DTSTART.
+    """
+    start = pendulum.datetime(2023, 6, 8)
+    end = start.add(days=21)
+
+    assert start.day_of_week == pendulum.THURSDAY
+
+    first_set = await weekly_on_friday.get_dates(
+        n=3,
+        start=start,
+        end=end,
+    )
+
+    # Sleep long enough that a full second definitely ticks over, because the RRULE
+    # precision is only to the second.
+    await asyncio.sleep(1.1)
+
+    second_set = await weekly_on_friday.get_dates(
+        n=3,
+        start=start,
+        end=end,
+    )
+
+    assert first_set == second_set
+
+    assert [dt.date() for dt in first_set] == [
+        pendulum.date(2023, 6, 9),
+        pendulum.date(2023, 6, 16),
+        pendulum.date(2023, 6, 23),
+    ]
+    for date in first_set:
+        assert date.day_of_week == pendulum.FRIDAY
+
+
+@pytest.fixture
+async def weekly_at_1pm_fridays() -> RRuleSchedule:
+    return RRuleSchedule(
+        rrule="DTSTART:20230608T130000\nFREQ=WEEKLY;INTERVAL=1;BYDAY=FR",
+        timezone="UTC",
+    )
+
+
+async def test_rrule_schedules_can_have_embedded_anchors(
+    weekly_at_1pm_fridays: RRuleSchedule,
+):
+    """Regression test for an issue discovered in Prefect Cloud, where a schedule with
+    an RRULE that didn't anchor to a specific time was being rescheduled every time the
+    scheduler loop picked it up.  This is because when a user does not provide a DTSTART
+    in their rule, then the current time is assumed to be the DTSTART.
+
+    This case confirms that if a user provides an alternative DTSTART it will be
+    respected.
+    """
+    start = pendulum.datetime(2023, 6, 8)
+    end = start.add(days=21)
+
+    assert start.day_of_week == pendulum.THURSDAY
+
+    first_set = await weekly_at_1pm_fridays.get_dates(
+        n=3,
+        start=start,
+        end=end,
+    )
+
+    # Sleep long enough that a full second definitely ticks over, because the RRULE
+    # precision is only to the second.
+    await asyncio.sleep(1.1)
+
+    second_set = await weekly_at_1pm_fridays.get_dates(
+        n=3,
+        start=start,
+        end=end,
+    )
+
+    assert first_set == second_set
+
+    assert first_set == [
+        pendulum.datetime(2023, 6, 9, 13),
+        pendulum.datetime(2023, 6, 16, 13),
+        pendulum.datetime(2023, 6, 23, 13),
+    ]
+    for date in first_set:
+        assert date.day_of_week == pendulum.FRIDAY

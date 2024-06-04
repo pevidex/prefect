@@ -3,20 +3,26 @@ Functions for interacting with flow ORM objects.
 Intended for internal use by the Prefect REST API.
 """
 
+from typing import Optional, Sequence, TypeVar, Union
 from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import Select
 
 import prefect.server.schemas as schemas
-from prefect.server.database.dependencies import inject_db
+from prefect.server.database import orm_models
+from prefect.server.database.dependencies import db_injector
 from prefect.server.database.interface import PrefectDBInterface
 
+T = TypeVar("T", bound=tuple)
 
-@inject_db
+
+@db_injector
 async def create_flow(
-    session: sa.orm.Session, flow: schemas.core.Flow, db: PrefectDBInterface
-):
+    db: PrefectDBInterface, session: AsyncSession, flow: schemas.core.Flow
+) -> orm_models.Flow:
     """
     Creates a new flow.
 
@@ -27,12 +33,12 @@ async def create_flow(
         flow: a flow model
 
     Returns:
-        db.Flow: the newly-created or existing flow
+        orm_models.Flow: the newly-created or existing flow
     """
 
     insert_stmt = (
-        (await db.insert(db.Flow))
-        .values(**flow.dict(shallow=True, exclude_unset=True))
+        db.insert(orm_models.Flow)
+        .values(**flow.model_dump_for_orm(exclude_unset=True))
         .on_conflict_do_nothing(
             index_elements=db.flow_unique_upsert_columns,
         )
@@ -40,25 +46,23 @@ async def create_flow(
     await session.execute(insert_stmt)
 
     query = (
-        sa.select(db.Flow)
+        sa.select(orm_models.Flow)
         .where(
-            db.Flow.name == flow.name,
+            orm_models.Flow.name == flow.name,
         )
         .limit(1)
         .execution_options(populate_existing=True)
     )
     result = await session.execute(query)
-    model = result.scalar()
+    model = result.scalar_one()
     return model
 
 
-@inject_db
 async def update_flow(
-    session: sa.orm.Session,
+    session: AsyncSession,
     flow_id: UUID,
     flow: schemas.actions.FlowUpdate,
-    db: PrefectDBInterface,
-):
+) -> bool:
     """
     Updates a flow.
 
@@ -71,17 +75,17 @@ async def update_flow(
         bool: whether or not matching rows were found to update
     """
     update_stmt = (
-        sa.update(db.Flow).where(db.Flow.id == flow_id)
+        sa.update(orm_models.Flow)
+        .where(orm_models.Flow.id == flow_id)
         # exclude_unset=True allows us to only update values provided by
         # the user, ignoring any defaults on the model
-        .values(**flow.dict(shallow=True, exclude_unset=True))
+        .values(**flow.model_dump_for_orm(exclude_unset=True))
     )
     result = await session.execute(update_stmt)
     return result.rowcount > 0
 
 
-@inject_db
-async def read_flow(session: sa.orm.Session, flow_id: UUID, db: PrefectDBInterface):
+async def read_flow(session: AsyncSession, flow_id: UUID) -> Optional[orm_models.Flow]:
     """
     Reads a flow by id.
 
@@ -90,13 +94,14 @@ async def read_flow(session: sa.orm.Session, flow_id: UUID, db: PrefectDBInterfa
         flow_id: a flow id
 
     Returns:
-        db.Flow: the flow
+        orm_models.Flow: the flow
     """
-    return await session.get(db.Flow, flow_id)
+    return await session.get(orm_models.Flow, flow_id)
 
 
-@inject_db
-async def read_flow_by_name(session: sa.orm.Session, name: str, db: PrefectDBInterface):
+async def read_flow_by_name(
+    session: AsyncSession, name: str
+) -> Optional[orm_models.Flow]:
     """
     Reads a flow by name.
 
@@ -105,65 +110,82 @@ async def read_flow_by_name(session: sa.orm.Session, name: str, db: PrefectDBInt
         name: a flow name
 
     Returns:
-        db.Flow: the flow
+        orm_models.Flow: the flow
     """
 
-    result = await session.execute(select(db.Flow).filter_by(name=name))
+    result = await session.execute(select(orm_models.Flow).filter_by(name=name))
     return result.scalar()
 
 
-@inject_db
+@db_injector
 async def _apply_flow_filters(
-    query,
     db: PrefectDBInterface,
-    flow_filter: schemas.filters.FlowFilter = None,
-    flow_run_filter: schemas.filters.FlowRunFilter = None,
-    task_run_filter: schemas.filters.TaskRunFilter = None,
-    deployment_filter: schemas.filters.DeploymentFilter = None,
-):
+    query: Select[T],
+    flow_filter: Union[schemas.filters.FlowFilter, None] = None,
+    flow_run_filter: Union[schemas.filters.FlowRunFilter, None] = None,
+    task_run_filter: Union[schemas.filters.TaskRunFilter, None] = None,
+    deployment_filter: Union[schemas.filters.DeploymentFilter, None] = None,
+    work_pool_filter: Union[schemas.filters.WorkPoolFilter, None] = None,
+) -> Select[T]:
     """
     Applies filters to a flow query as a combination of EXISTS subqueries.
     """
 
     if flow_filter:
-        query = query.where(flow_filter.as_sql_filter(db))
+        query = query.where(flow_filter.as_sql_filter())
 
-    if deployment_filter:
-        exists_clause = select(db.Deployment).where(
-            db.Deployment.flow_id == db.Flow.id,
-            deployment_filter.as_sql_filter(db),
+    if deployment_filter or work_pool_filter:
+        exists_clause = select(orm_models.Deployment).where(
+            orm_models.Deployment.flow_id == orm_models.Flow.id
         )
+
+        if deployment_filter:
+            exists_clause = exists_clause.where(
+                deployment_filter.as_sql_filter(),
+            )
+
+        if work_pool_filter:
+            exists_clause = exists_clause.join(
+                orm_models.WorkQueue,
+                orm_models.WorkQueue.id == orm_models.Deployment.work_queue_id,
+            )
+            exists_clause = exists_clause.join(
+                orm_models.WorkPool,
+                orm_models.WorkPool.id == orm_models.WorkQueue.work_pool_id,
+            ).where(work_pool_filter.as_sql_filter())
+
         query = query.where(exists_clause.exists())
 
     if flow_run_filter or task_run_filter:
-        exists_clause = select(db.FlowRun).where(db.FlowRun.flow_id == db.Flow.id)
+        exists_clause = select(orm_models.FlowRun).where(
+            orm_models.FlowRun.flow_id == orm_models.Flow.id
+        )
 
         if flow_run_filter:
-            exists_clause = exists_clause.where(flow_run_filter.as_sql_filter(db))
+            exists_clause = exists_clause.where(flow_run_filter.as_sql_filter())
 
         if task_run_filter:
             exists_clause = exists_clause.join(
-                db.TaskRun,
-                db.TaskRun.flow_run_id == db.FlowRun.id,
-            ).where(task_run_filter.as_sql_filter(db))
+                orm_models.TaskRun,
+                orm_models.TaskRun.flow_run_id == orm_models.FlowRun.id,
+            ).where(task_run_filter.as_sql_filter())
 
         query = query.where(exists_clause.exists())
 
     return query
 
 
-@inject_db
 async def read_flows(
-    session: sa.orm.Session,
-    db: PrefectDBInterface,
-    flow_filter: schemas.filters.FlowFilter = None,
-    flow_run_filter: schemas.filters.FlowRunFilter = None,
-    task_run_filter: schemas.filters.TaskRunFilter = None,
-    deployment_filter: schemas.filters.DeploymentFilter = None,
+    session: AsyncSession,
+    flow_filter: Union[schemas.filters.FlowFilter, None] = None,
+    flow_run_filter: Union[schemas.filters.FlowRunFilter, None] = None,
+    task_run_filter: Union[schemas.filters.TaskRunFilter, None] = None,
+    deployment_filter: Union[schemas.filters.DeploymentFilter, None] = None,
+    work_pool_filter: Union[schemas.filters.WorkPoolFilter, None] = None,
     sort: schemas.sorting.FlowSort = schemas.sorting.FlowSort.NAME_ASC,
-    offset: int = None,
-    limit: int = None,
-):
+    offset: Union[int, None] = None,
+    limit: Union[int, None] = None,
+) -> Sequence[orm_models.Flow]:
     """
     Read multiple flows.
 
@@ -173,14 +195,15 @@ async def read_flows(
         flow_run_filter: only select flows whose flow runs match these filters
         task_run_filter: only select flows whose task runs match these filters
         deployment_filter: only select flows whose deployments match these filters
+        work_pool_filter: only select flows whose work pools match these filters
         offset: Query offset
         limit: Query limit
 
     Returns:
-        List[db.Flow]: flows
+        List[orm_models.Flow]: flows
     """
 
-    query = select(db.Flow).order_by(sort.as_sql_sort(db=db))
+    query = select(orm_models.Flow).order_by(sort.as_sql_sort())
 
     query = await _apply_flow_filters(
         query,
@@ -188,7 +211,7 @@ async def read_flows(
         flow_run_filter=flow_run_filter,
         task_run_filter=task_run_filter,
         deployment_filter=deployment_filter,
-        db=db,
+        work_pool_filter=work_pool_filter,
     )
 
     if offset is not None:
@@ -201,14 +224,13 @@ async def read_flows(
     return result.scalars().unique().all()
 
 
-@inject_db
 async def count_flows(
-    session: sa.orm.Session,
-    db: PrefectDBInterface,
-    flow_filter: schemas.filters.FlowFilter = None,
-    flow_run_filter: schemas.filters.FlowRunFilter = None,
-    task_run_filter: schemas.filters.TaskRunFilter = None,
-    deployment_filter: schemas.filters.DeploymentFilter = None,
+    session: AsyncSession,
+    flow_filter: Union[schemas.filters.FlowFilter, None] = None,
+    flow_run_filter: Union[schemas.filters.FlowRunFilter, None] = None,
+    task_run_filter: Union[schemas.filters.TaskRunFilter, None] = None,
+    deployment_filter: Union[schemas.filters.DeploymentFilter, None] = None,
+    work_pool_filter: Union[schemas.filters.WorkPoolFilter, None] = None,
 ) -> int:
     """
     Count flows.
@@ -219,12 +241,13 @@ async def count_flows(
         flow_run_filter: only count flows whose flow runs match these filters
         task_run_filter: only count flows whose task runs match these filters
         deployment_filter: only count flows whose deployments match these filters
+        work_pool_filter: only count flows whose work pools match these filters
 
     Returns:
         int: count of flows
     """
 
-    query = select(sa.func.count(sa.text("*"))).select_from(db.Flow)
+    query = select(sa.func.count(sa.text("*"))).select_from(orm_models.Flow)
 
     query = await _apply_flow_filters(
         query,
@@ -232,17 +255,14 @@ async def count_flows(
         flow_run_filter=flow_run_filter,
         task_run_filter=task_run_filter,
         deployment_filter=deployment_filter,
-        db=db,
+        work_pool_filter=work_pool_filter,
     )
 
     result = await session.execute(query)
-    return result.scalar()
+    return result.scalar_one()
 
 
-@inject_db
-async def delete_flow(
-    session: sa.orm.Session, flow_id: UUID, db: PrefectDBInterface
-) -> bool:
+async def delete_flow(session: AsyncSession, flow_id: UUID) -> bool:
     """
     Delete a flow by id.
 
@@ -254,5 +274,7 @@ async def delete_flow(
         bool: whether or not the flow was deleted
     """
 
-    result = await session.execute(delete(db.Flow).where(db.Flow.id == flow_id))
+    result = await session.execute(
+        delete(orm_models.Flow).where(orm_models.Flow.id == flow_id)
+    )
     return result.rowcount > 0

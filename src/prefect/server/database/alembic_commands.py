@@ -2,7 +2,7 @@ from functools import wraps
 from pathlib import Path
 from threading import Lock
 
-import prefect
+import prefect.server
 
 ALEMBIC_LOCK = Lock()
 
@@ -54,7 +54,7 @@ def alembic_upgrade(revision: str = "head", dry_run: bool = False):
 
 
 @with_alembic_lock
-def alembic_downgrade(revision: str = "base", dry_run: bool = False):
+def alembic_downgrade(revision: str = "-1", dry_run: bool = False):
     """
     Run alembic downgrades on Prefect REST API database
 

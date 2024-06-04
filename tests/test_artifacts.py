@@ -1,14 +1,16 @@
 import json
 from typing import List
 
-import pydantic
 import pytest
 
 from prefect import flow, task
 from prefect.artifacts import (
+    create_image_artifact,
     create_link_artifact,
     create_markdown_artifact,
+    create_progress_artifact,
     create_table_artifact,
+    update_progress_artifact,
 )
 from prefect.context import get_run_context
 from prefect.server import schemas
@@ -33,7 +35,7 @@ class TestCreateArtifacts:
         )
 
         response = await client.get(f"/artifacts/{artifact_id}")
-        result = pydantic.parse_obj_as(schemas.core.Artifact, response.json())
+        result = schemas.core.Artifact.model_validate(response.json())
         assert result.data == f"[{my_link}]({my_link})"
 
     async def test_create_and_read_link_artifact_with_linktext_succeeds(
@@ -49,7 +51,7 @@ class TestCreateArtifacts:
         )
 
         response = await client.get(f"/artifacts/{artifact_id}")
-        result = pydantic.parse_obj_as(schemas.core.Artifact, response.json())
+        result = schemas.core.Artifact.model_validate(response.json())
         assert result.data == f"[{link_text}]({my_link})"
 
     async def test_create_link_artifact_in_task_succeeds(self, client):
@@ -73,7 +75,7 @@ class TestCreateArtifacts:
         my_artifact_id, flow_run_id, task_run_id = my_flow()
 
         response = await client.get(f"/artifacts/{my_artifact_id}")
-        my_link_artifact = pydantic.parse_obj_as(schemas.core.Artifact, response.json())
+        my_link_artifact = schemas.core.Artifact.model_validate(response.json())
 
         assert my_link_artifact.flow_run_id == flow_run_id
         assert my_link_artifact.task_run_id == task_run_id
@@ -94,7 +96,7 @@ class TestCreateArtifacts:
         my_artifact_id, flow_run_id = my_flow()
 
         response = await client.get(f"/artifacts/{my_artifact_id}")
-        my_link_artifact = pydantic.parse_obj_as(schemas.core.Artifact, response.json())
+        my_link_artifact = schemas.core.Artifact.model_validate(response.json())
 
         assert my_link_artifact.flow_run_id == flow_run_id
         assert my_link_artifact.task_run_id is None
@@ -120,7 +122,7 @@ class TestCreateArtifacts:
         my_artifact_id, flow_run_id = my_flow()
 
         response = await client.get(f"/artifacts/{my_artifact_id}")
-        my_link_artifact = pydantic.parse_obj_as(schemas.core.Artifact, response.json())
+        my_link_artifact = schemas.core.Artifact.model_validate(response.json())
 
         assert my_link_artifact.flow_run_id == flow_run_id
         assert my_link_artifact.task_run_id is None
@@ -158,7 +160,7 @@ class TestCreateArtifacts:
         )
 
         response = await client.get(f"/artifacts/{artifact_id}")
-        result = pydantic.parse_obj_as(schemas.core.Artifact, response.json())
+        result = schemas.core.Artifact.model_validate(response.json())
         assert result.data == my_markdown
 
     async def test_create_markdown_artifact_in_task_succeeds(self, client):
@@ -182,9 +184,7 @@ class TestCreateArtifacts:
         my_artifact_id, flow_run_id, task_run_id = my_flow()
 
         response = await client.get(f"/artifacts/{my_artifact_id}")
-        my_markdown_artifact = pydantic.parse_obj_as(
-            schemas.core.Artifact, response.json()
-        )
+        my_markdown_artifact = schemas.core.Artifact.model_validate(response.json())
 
         assert my_markdown_artifact.flow_run_id == flow_run_id
         assert my_markdown_artifact.task_run_id == task_run_id
@@ -205,9 +205,7 @@ class TestCreateArtifacts:
         my_artifact_id, flow_run_id = my_flow()
 
         response = await client.get(f"/artifacts/{my_artifact_id}")
-        my_markdown_artifact = pydantic.parse_obj_as(
-            schemas.core.Artifact, response.json()
-        )
+        my_markdown_artifact = schemas.core.Artifact.model_validate(response.json())
 
         assert my_markdown_artifact.flow_run_id == flow_run_id
         assert my_markdown_artifact.task_run_id is None
@@ -232,9 +230,7 @@ class TestCreateArtifacts:
         my_artifact_id, flow_run_id = my_flow()
 
         response = await client.get(f"/artifacts/{my_artifact_id}")
-        my_markdown_artifact = pydantic.parse_obj_as(
-            schemas.core.Artifact, response.json()
-        )
+        my_markdown_artifact = schemas.core.Artifact.model_validate(response.json())
 
         assert my_markdown_artifact.flow_run_id == flow_run_id
         assert my_markdown_artifact.task_run_id is None
@@ -247,8 +243,7 @@ class TestCreateArtifacts:
         @task
         def add_ten(x):
             create_markdown_artifact(
-                # TODO: uncomment this out once unique constraint is dropped on artifact key
-                # key="new-markdown-artifact",
+                key="new-markdown-artifact",
                 markdown="my markdown",
                 description="my-artifact-description",
             )
@@ -274,9 +269,9 @@ class TestCreateArtifacts:
         )
 
         response = await client.get(f"/artifacts/{artifact_id}")
-        result = pydantic.parse_obj_as(schemas.core.Artifact, response.json())
-
-        assert result.data == my_table
+        result = schemas.core.Artifact.model_validate(response.json())
+        result_data = json.loads(result.data)
+        assert result_data == my_table
 
     async def test_create_and_read_list_of_dict_table_artifact_succeeds(
         self, artifact, client
@@ -290,8 +285,24 @@ class TestCreateArtifacts:
         )
 
         response = await client.get(f"/artifacts/{artifact_id}")
-        result = pydantic.parse_obj_as(schemas.core.Artifact, response.json())
+        result = schemas.core.Artifact.model_validate(response.json())
 
+        result_data = json.loads(result.data)
+        assert result_data == my_table
+
+    async def test_create_and_read_list_of_list_table_artifact_succeeds(
+        self, artifact, client
+    ):
+        my_table = [[1, 2], [None, 4]]
+
+        artifact_id = await create_table_artifact(
+            key=artifact.key,
+            table=my_table,
+            description=artifact.description,
+        )
+
+        response = await client.get(f"/artifacts/{artifact_id}")
+        result = schemas.core.Artifact.model_validate(response.json())
         result_data = json.loads(result.data)
         assert result_data == my_table
 
@@ -317,13 +328,12 @@ class TestCreateArtifacts:
         my_artifact_id, flow_run_id, task_run_id = my_flow()
 
         response = await client.get(f"/artifacts/{my_artifact_id}")
-        my_table_artifact = pydantic.parse_obj_as(
-            schemas.core.Artifact, response.json()
-        )
+        my_table_artifact = schemas.core.Artifact.model_validate(response.json())
 
         assert my_table_artifact.flow_run_id == flow_run_id
         assert my_table_artifact.task_run_id == task_run_id
-        assert my_table_artifact.data == {"a": [1, 3], "b": [2, 4]}
+        result_data = json.loads(my_table_artifact.data)
+        assert result_data == {"a": [1, 3], "b": [2, 4]}
 
     async def test_create_table_artifact_in_flow_succeeds(self, client):
         @flow
@@ -342,13 +352,12 @@ class TestCreateArtifacts:
         my_artifact_id, flow_run_id = my_flow()
 
         response = await client.get(f"/artifacts/{my_artifact_id}")
-        my_table_artifact = pydantic.parse_obj_as(
-            schemas.core.Artifact, response.json()
-        )
+        my_table_artifact = schemas.core.Artifact.model_validate(response.json())
 
         assert my_table_artifact.flow_run_id == flow_run_id
         assert my_table_artifact.task_run_id is None
-        assert my_table_artifact.data == {"a": [1, 3], "b": [2, 4]}
+        result_data = json.loads(my_table_artifact.data)
+        assert result_data == {"a": [1, 3], "b": [2, 4]}
 
     async def test_create_table_artifact_in_subflow_succeeds(self, client):
         @flow
@@ -371,12 +380,11 @@ class TestCreateArtifacts:
         my_artifact_id, flow_run_id = my_flow()
 
         response = await client.get(f"/artifacts/{my_artifact_id}")
-        my_table_artifact = pydantic.parse_obj_as(
-            schemas.core.Artifact, response.json()
-        )
+        my_table_artifact = schemas.core.Artifact.model_validate(response.json())
 
         assert my_table_artifact.flow_run_id == flow_run_id
-        assert my_table_artifact.data == {"a": [1, 3], "b": [2, 4]}
+        result_data = json.loads(my_table_artifact.data)
+        assert result_data == {"a": [1, 3], "b": [2, 4]}
         assert my_table_artifact.task_run_id is None
 
     async def test_create_table_artifact_using_map_succeeds(self):
@@ -403,3 +411,282 @@ class TestCreateArtifacts:
 
         my_big_nums = simple_map([1, 2, 3])
         assert my_big_nums == [11, 12, 13]
+
+    async def test_create_dict_table_artifact_with_none_succeeds(self):
+        my_table = {"a": [1, 3], "b": [2, None]}
+
+        await create_table_artifact(
+            key="swiss-table",
+            table=my_table,
+            description="my-artifact-description",
+        )
+
+    async def test_create_dict_table_artifact_with_nan_succeeds(self, client):
+        my_table = {"a": [1, 3], "b": [2, float("nan")]}
+
+        artifact_id = await create_table_artifact(
+            key="swiss-table",
+            table=my_table,
+            description="my-artifact-description",
+        )
+
+        response = await client.get(f"/artifacts/{artifact_id}")
+        my_artifact = schemas.core.Artifact.model_validate(response.json())
+        my_data = json.loads(my_artifact.data)
+        assert my_data == {"a": [1, 3], "b": [2, None]}
+
+    async def test_create_list_table_artifact_with_none_succeeds(self):
+        my_table = [
+            {"a": 1, "b": 2},
+            {"a": 3, "b": None},
+        ]
+
+        await create_table_artifact(
+            key="swiss-table",
+            table=my_table,
+            description="my-artifact-description",
+        )
+
+    async def test_create_list_table_artifact_with_nan_succeeds(self, client):
+        my_table = [
+            {"a": 1, "b": 2},
+            {"a": 3, "b": float("nan")},
+        ]
+
+        artifact_id = await create_table_artifact(
+            key="swiss-table",
+            table=my_table,
+            description="my-artifact-description",
+        )
+
+        response = await client.get(f"/artifacts/{artifact_id}")
+        my_artifact = schemas.core.Artifact.model_validate(response.json())
+        my_data = json.loads(my_artifact.data)
+        assert my_data == [
+            {"a": 1, "b": 2},
+            {"a": 3, "b": None},
+        ]
+
+    async def test_create_progress_artifact_without_key(self, client):
+        progress = 0.0
+
+        artifact_id = await create_progress_artifact(
+            progress, description="my-description"
+        )
+
+        response = await client.get(f"/artifacts/{artifact_id}")
+        my_artifact = schemas.core.Artifact.model_validate(response.json())
+        assert my_artifact.data == progress
+        assert my_artifact.type == "progress"
+        assert my_artifact.description == "my-description"
+
+    async def test_create_progress_artifact_with_key(self, client):
+        progress = 0.0
+
+        artifact_id = await create_progress_artifact(
+            progress, key="progress-artifact", description="my-description"
+        )
+
+        response = await client.get(f"/artifacts/{artifact_id}")
+        my_artifact = schemas.core.Artifact.model_validate(response.json())
+        assert my_artifact.data == progress
+        assert my_artifact.type == "progress"
+        assert my_artifact.key == "progress-artifact"
+        assert my_artifact.description == "my-description"
+
+    async def test_create_progress_artifact_in_task_succeeds(self, client):
+        @task
+        def my_task():
+            task_run_id = get_run_context().task_run.id
+            artifact_id = create_progress_artifact(
+                key="task-link-artifact-3",
+                progress=0.0,
+                description="my-artifact-description",
+            )
+            return artifact_id, task_run_id
+
+        @flow
+        def my_flow():
+            flow_run_id = get_run_context().flow_run.id
+            artifact_id, task_run_id = my_task()
+
+            return artifact_id, flow_run_id, task_run_id
+
+        my_artifact_id, flow_run_id, task_run_id = my_flow()
+
+        response = await client.get(f"/artifacts/{my_artifact_id}")
+        my_progress_artifact = schemas.core.Artifact.model_validate(response.json())
+
+        assert my_progress_artifact.flow_run_id == flow_run_id
+        assert my_progress_artifact.task_run_id == task_run_id
+        assert my_progress_artifact.data == 0.0
+        assert my_progress_artifact.type == "progress"
+        assert my_progress_artifact.description == "my-artifact-description"
+
+    async def test_create_progess_artifact_in_flow_succeeds(self, client):
+        @flow
+        def my_flow():
+            flow_run_id = get_run_context().flow_run.id
+
+            artifact_id = create_progress_artifact(
+                key="task-link-artifact-4",
+                progress=0.0,
+                description="my-artifact-description",
+            )
+
+            return artifact_id, flow_run_id
+
+        my_artifact_id, flow_run_id = my_flow()
+
+        response = await client.get(f"/artifacts/{my_artifact_id}")
+        my_progress_artifact = schemas.core.Artifact.model_validate(response.json())
+
+        assert my_progress_artifact.flow_run_id == flow_run_id
+        assert my_progress_artifact.task_run_id is None
+        assert my_progress_artifact.data == 0.0
+        assert my_progress_artifact.type == "progress"
+        assert my_progress_artifact.description == "my-artifact-description"
+
+    async def test_create_image_artifact_succeeds(self, client):
+        image_url = "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png"
+        artifact_id = await create_image_artifact(
+            image_url=image_url,
+            key="google-logo",
+            description="This is the google logo",
+        )
+
+        response = await client.get(f"/artifacts/{artifact_id}")
+        result = schemas.core.Artifact.model_validate(response.json())
+        assert result.data == image_url
+
+    async def test_create_image_artifact_in_task_succeeds(self, client):
+        @task
+        def my_task():
+            task_run_id = get_run_context().task_run.id
+            artifact_id = create_image_artifact(
+                image_url="https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png",
+                key="task-link-artifact-3",
+                description="my-artifact-description",
+            )
+            return artifact_id, task_run_id
+
+        @flow
+        def my_flow():
+            flow_run_id = get_run_context().flow_run.id
+            artifact_id, task_run_id = my_task()
+
+            return artifact_id, flow_run_id, task_run_id
+
+        my_artifact_id, flow_run_id, task_run_id = my_flow()
+
+        response = await client.get(f"/artifacts/{my_artifact_id}")
+        my_image_artifact = schemas.core.Artifact.model_validate(response.json())
+
+        assert my_image_artifact.flow_run_id == flow_run_id
+        assert my_image_artifact.task_run_id == task_run_id
+        assert (
+            my_image_artifact.data
+            == "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png"
+        )
+        assert my_image_artifact.type == "image"
+        assert my_image_artifact.description == "my-artifact-description"
+
+    async def test_create_image_artifact_in_flow_succeeds(self, client):
+        @flow
+        def my_flow():
+            flow_run_id = get_run_context().flow_run.id
+
+            artifact_id = create_image_artifact(
+                image_url="https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png",
+                key="task-link-artifact-4",
+                description="my-artifact-description",
+            )
+
+            return artifact_id, flow_run_id
+
+        my_artifact_id, flow_run_id = my_flow()
+
+        response = await client.get(f"/artifacts/{my_artifact_id}")
+        my_image_artifact = schemas.core.Artifact.model_validate(response.json())
+
+        assert my_image_artifact.flow_run_id == flow_run_id
+        assert my_image_artifact.task_run_id is None
+        assert (
+            my_image_artifact.data
+            == "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png"
+        )
+        assert my_image_artifact.type == "image"
+        assert my_image_artifact.description == "my-artifact-description"
+
+
+class TestUpdateArtifacts:
+    async def test_update_progress_artifact_updates_progress(self, client):
+        progress = 0.0
+
+        artifact_id = await create_progress_artifact(progress)
+
+        response = await client.get(f"/artifacts/{artifact_id}")
+        my_artifact = schemas.core.Artifact.model_validate(response.json())
+        assert my_artifact.data == progress
+        assert my_artifact.type == "progress"
+
+        new_progress = 50.0
+        await update_progress_artifact(artifact_id, new_progress)
+        response = await client.get(f"/artifacts/{artifact_id}")
+        my_artifact = schemas.core.Artifact.model_validate(response.json())
+        assert my_artifact.data == new_progress
+
+    async def test_update_progress_artifact_in_task(self, client):
+        @task
+        def my_task():
+            task_run_id = get_run_context().task_run.id
+            artifact_id = create_progress_artifact(
+                key="task-link-artifact-3",
+                progress=0.0,
+                description="my-artifact-description",
+            )
+            update_progress_artifact(artifact_id, 50.0)
+            return artifact_id, task_run_id
+
+        @flow
+        def my_flow():
+            flow_run_id = get_run_context().flow_run.id
+            artifact_id, task_run_id = my_task()
+
+            return artifact_id, flow_run_id, task_run_id
+
+        my_artifact_id, flow_run_id, task_run_id = my_flow()
+
+        response = await client.get(f"/artifacts/{my_artifact_id}")
+        my_progress_artifact = schemas.core.Artifact.model_validate(response.json())
+
+        assert my_progress_artifact.flow_run_id == flow_run_id
+        assert my_progress_artifact.task_run_id == task_run_id
+        assert my_progress_artifact.data == 50.0
+        assert my_progress_artifact.type == "progress"
+        assert my_progress_artifact.description == "my-artifact-description"
+
+    async def test_update_progress_artifact_in_flow(self, client):
+        @flow
+        def my_flow():
+            flow_run_id = get_run_context().flow_run.id
+
+            artifact_id = create_progress_artifact(
+                key="task-link-artifact-4",
+                progress=0.0,
+                description="my-artifact-description",
+            )
+            update_progress_artifact(artifact_id, 50.0)
+
+            return artifact_id, flow_run_id
+
+        my_artifact_id, flow_run_id = my_flow()
+
+        response = await client.get(f"/artifacts/{my_artifact_id}")
+        my_progress_artifact = schemas.core.Artifact.model_validate(response.json())
+
+        assert my_progress_artifact.flow_run_id == flow_run_id
+        assert my_progress_artifact.task_run_id is None
+        assert my_progress_artifact.data == 50.0
+        assert my_progress_artifact.type == "progress"
+        assert my_progress_artifact.description == "my-artifact-description"

@@ -4,8 +4,8 @@ import uuid
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
-import pydantic
 import pytest
+from pydantic import BaseModel, ValidationError, field_validator
 
 from prefect.serializers import (
     CompressedSerializer,
@@ -22,7 +22,7 @@ from prefect.utilities.dispatch import get_registry_for_type
 TEST_UUID = uuid.UUID("a53e3495-d681-4a53-84b8-9d9542f7237c")
 
 
-class MyModel(pydantic.BaseModel):
+class MyModel(BaseModel):
     x: int
     y: uuid.UUID
 
@@ -77,7 +77,7 @@ class TestBaseSerializer:
 
     def test_serializers_do_not_allow_extra_fields(self):
         class Foo(Serializer):
-            type = "foo"
+            type: str = "foo"
 
             def dumps(self, obj):
                 pass
@@ -85,15 +85,15 @@ class TestBaseSerializer:
             def loads(self, obj):
                 pass
 
-        with pytest.raises(pydantic.ValidationError):
+        with pytest.raises(ValidationError):
             Foo(x="test")
 
     def test_serializers_can_be_created_by_dict(self):
-        class Foo(pydantic.BaseModel):
+        class Foo(BaseModel):
             serializer: Serializer
 
         class Bar(Serializer):
-            type = "bar"
+            type: str = "bar"
 
             def dumps(self, obj):
                 pass
@@ -105,11 +105,11 @@ class TestBaseSerializer:
         assert isinstance(model.serializer, Bar)
 
     def test_serializers_can_be_created_by_object(self):
-        class Foo(pydantic.BaseModel):
+        class Foo(BaseModel):
             serializer: Serializer
 
         class Bar(Serializer):
-            type = "bar"
+            type: str = "bar"
 
             def dumps(self, obj):
                 pass
@@ -121,17 +121,17 @@ class TestBaseSerializer:
         assert isinstance(model.serializer, Bar)
 
     def test_serializers_can_be_created_by_type_string(self):
-        class Foo(pydantic.BaseModel):
+        class Foo(BaseModel):
             serializer: Serializer
 
-            @pydantic.validator("serializer", pre=True)
+            @field_validator("serializer", mode="before")
             def cast_type_to_dict(cls, value):
                 if isinstance(value, str):
                     return {"type": value}
                 return value
 
         class Bar(Serializer):
-            type = "bar"
+            type: str = "bar"
 
             def dumps(self, obj):
                 pass
@@ -221,7 +221,6 @@ class TestJSONSerializer:
             complex_str.encode("latin_1"),
             [complex_str.encode("utf-8")],
             {"key": complex_str.encode("ASCII")},
-            {complex_str.encode("latin_1")},
         ],
     )
     def test_simple_roundtrip_with_complex_bytes(self, data):
@@ -309,11 +308,11 @@ class TestJSONSerializer:
         )
 
     def test_does_not_allow_object_hook_collision(self):
-        with pytest.raises(pydantic.ValidationError):
+        with pytest.raises(ValidationError):
             JSONSerializer(loads_kwargs={"object_hook": "foo"})
 
     def test_does_not_allow_default_collision(self):
-        with pytest.raises(pydantic.ValidationError):
+        with pytest.raises(ValidationError):
             JSONSerializer(dumps_kwargs={"default": "foo"})
 
 

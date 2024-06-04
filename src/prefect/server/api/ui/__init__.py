@@ -1,2 +1,2 @@
 """Routes primarily for use by the UI"""
-import prefect.server.api.ui.flow_runs
+from . import flows, flow_runs, schemas, task_runs

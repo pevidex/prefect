@@ -5,14 +5,18 @@ Defines the Prefect REST API FastAPI app.
 import asyncio
 import mimetypes
 import os
+import shutil
+import sqlite3
 from contextlib import asynccontextmanager
 from functools import partial, wraps
 from hashlib import sha256
-from typing import Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 import anyio
+import asyncpg
 import sqlalchemy as sa
 import sqlalchemy.exc
+import sqlalchemy.orm.exc
 from fastapi import APIRouter, Depends, FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -28,8 +32,13 @@ import prefect.server.api as api
 import prefect.server.services as services
 import prefect.settings
 from prefect._internal.compatibility.experimental import enabled_experiments
+from prefect.client.constants import SERVER_API_VERSION
 from prefect.logging import get_logger
 from prefect.server.api.dependencies import EnforceMinimumAPIVersion
+from prefect.server.events import stream
+from prefect.server.events.services.actions import Actions
+from prefect.server.events.services.event_persister import EventPersister
+from prefect.server.events.services.triggers import ProactiveTriggers, ReactiveTriggers
 from prefect.server.exceptions import ObjectNotFoundError
 from prefect.server.utilities.database import get_dialect
 from prefect.server.utilities.server import method_paths_from_routes
@@ -38,6 +47,7 @@ from prefect.settings import (
     PREFECT_DEBUG_MODE,
     PREFECT_MEMO_STORE_PATH,
     PREFECT_MEMOIZE_BLOCK_AUTO_REGISTRATION,
+    PREFECT_UI_SERVE_BASE,
 )
 from prefect.utilities.hashing import hash_objects
 
@@ -45,8 +55,6 @@ TITLE = "Prefect Server"
 API_TITLE = "Prefect Prefect REST API"
 UI_TITLE = "Prefect Prefect REST API UI"
 API_VERSION = prefect.__version__
-SERVER_API_VERSION = "0.8.4"
-ORION_API_VERSION = SERVER_API_VERSION  # Deprecated. Available for compatibility.
 
 logger = get_logger("server")
 
@@ -69,6 +77,7 @@ API_ROUTERS = (
     api.saved_searches.router,
     api.logs.router,
     api.concurrency_limits.router,
+    api.concurrency_limits_v2.router,
     api.block_types.router,
     api.block_documents.router,
     api.workers.router,
@@ -78,10 +87,19 @@ API_ROUTERS = (
     api.block_capabilities.router,
     api.collections.router,
     api.variables.router,
+    api.csrf_token.router,
+    api.events.router,
+    api.automations.router,
+    api.templates.router,
+    api.ui.flows.router,
     api.ui.flow_runs.router,
+    api.ui.schemas.router,
+    api.ui.task_runs.router,
     api.admin.router,
     api.root.router,
 )
+
+SQLITE_LOCKED_MSG = "database is locked"
 
 
 class SPAStaticFiles(StaticFiles):
@@ -133,7 +151,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 async def integrity_exception_handler(request: Request, exc: Exception):
     """Capture database integrity errors."""
-    logger.error(f"Encountered exception in request:", exc_info=True)
+    logger.error("Encountered exception in request:", exc_info=True)
     return JSONResponse(
         content={
             "detail": (
@@ -146,32 +164,87 @@ async def integrity_exception_handler(request: Request, exc: Exception):
     )
 
 
-async def db_locked_exception_handler(
-    request: Request, exc: sqlalchemy.exc.OperationalError
+def is_client_retryable_exception(exc: Exception):
+    if isinstance(exc, sqlalchemy.exc.OperationalError) and isinstance(
+        exc.orig, sqlite3.OperationalError
+    ):
+        if getattr(exc.orig, "sqlite_errorname", None) in {
+            "SQLITE_BUSY",
+            "SQLITE_BUSY_SNAPSHOT",
+        } or SQLITE_LOCKED_MSG in getattr(exc.orig, "args", []):
+            return True
+        else:
+            # Avoid falling through to the generic `DBAPIError` case below
+            return False
+
+    if isinstance(
+        exc,
+        (
+            sqlalchemy.exc.DBAPIError,
+            asyncpg.exceptions.QueryCanceledError,
+            asyncpg.exceptions.ConnectionDoesNotExistError,
+            asyncpg.exceptions.CannotConnectNowError,
+            sqlalchemy.exc.InvalidRequestError,
+            sqlalchemy.orm.exc.DetachedInstanceError,
+        ),
+    ):
+        return True
+
+    return False
+
+
+def replace_placeholder_string_in_files(
+    directory, placeholder, replacement, allowed_extensions=None
 ):
     """
-    Catch all sqlalchemy.exc.OperationalError. Return a 503 if it's a db locked error
-    to retry, otherwise log the error and return 500.
+    Recursively loops through all files in the given directory and replaces
+    a placeholder string.
     """
-    if (
-        getattr(exc.orig, "sqlite_errorname", None) == "SQLITE_BUSY"
-        and getattr(exc.orig, "sqlite_errorcode", None) == 5
-    ):
+    if allowed_extensions is None:
+        allowed_extensions = [".txt", ".html", ".css", ".js", ".json", ".txt"]
+
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if any(file.endswith(ext) for ext in allowed_extensions):
+                file_path = os.path.join(root, file)
+
+                with open(file_path, "r", encoding="utf-8") as file:
+                    file_data = file.read()
+
+                file_data = file_data.replace(placeholder, replacement)
+
+                with open(file_path, "w", encoding="utf-8") as file:
+                    file.write(file_data)
+
+
+def copy_directory(directory, path):
+    os.makedirs(path, exist_ok=True)
+    for item in os.listdir(directory):
+        source = os.path.join(directory, item)
+        destination = os.path.join(path, item)
+
+        if os.path.isdir(source):
+            if os.path.exists(destination):
+                shutil.rmtree(destination)
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            shutil.copy2(source, destination)
+
+
+async def custom_internal_exception_handler(request: Request, exc: Exception):
+    """
+    Log a detailed exception for internal server errors before returning.
+
+    Send 503 for errors clients can retry on.
+    """
+    logger.error("Encountered exception in request:", exc_info=True)
+
+    if is_client_retryable_exception(exc):
         return JSONResponse(
             content={"exception_message": "Service Unavailable"},
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
-    logger.error(f"Encountered exception in request:", exc_info=True)
-    return JSONResponse(
-        content={"exception_message": "Internal Server Error"},
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-    )
-
-
-async def custom_internal_exception_handler(request: Request, exc: Exception):
-    """Log a detailed exception for internal server errors before returning."""
-    logger.error(f"Encountered exception in request:", exc_info=True)
     return JSONResponse(
         content={"exception_message": "Internal Server Error"},
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -187,12 +260,12 @@ async def prefect_object_not_found_exception_handler(
     )
 
 
-def create_orion_api(
+def create_api_app(
     router_prefix: Optional[str] = "",
     dependencies: Optional[List[Depends]] = None,
     health_check_path: str = "/health",
     version_check_path: str = "/version",
-    fast_api_app_kwargs: dict = None,
+    fast_api_app_kwargs: Optional[Dict[str, Any]] = None,
     router_overrides: Mapping[str, Optional[APIRouter]] = None,
 ) -> FastAPI:
     """
@@ -272,28 +345,72 @@ def create_orion_api(
 
 def create_ui_app(ephemeral: bool) -> FastAPI:
     ui_app = FastAPI(title=UI_TITLE)
-    ui_app.add_middleware(GZipMiddleware)
+    base_url = prefect.settings.PREFECT_UI_SERVE_BASE.value()
+    cache_key = f"{prefect.__version__}:{base_url}"
+    stripped_base_url = base_url.rstrip("/")
+    static_dir = (
+        prefect.settings.PREFECT_UI_STATIC_DIRECTORY.value()
+        or prefect.__ui_static_subpath__
+    )
+    reference_file_name = "UI_SERVE_BASE"
 
     if os.name == "nt":
         # Windows defaults to text/plain for .js files
         mimetypes.init()
         mimetypes.add_type("application/javascript", ".js")
 
-    @ui_app.get("/ui-settings")
+    @ui_app.get(f"{stripped_base_url}/ui-settings")
     def ui_settings():
         return {
             "api_url": prefect.settings.PREFECT_UI_API_URL.value(),
+            "csrf_enabled": prefect.settings.PREFECT_SERVER_CSRF_PROTECTION_ENABLED.value(),
             "flags": enabled_experiments(),
         }
+
+    def reference_file_matches_base_url():
+        reference_file_path = os.path.join(static_dir, reference_file_name)
+
+        if os.path.exists(static_dir):
+            try:
+                with open(reference_file_path, "r") as f:
+                    return f.read() == cache_key
+            except FileNotFoundError:
+                return False
+        else:
+            return False
+
+    def create_ui_static_subpath():
+        if not os.path.exists(static_dir):
+            os.makedirs(static_dir)
+
+        copy_directory(prefect.__ui_static_path__, static_dir)
+        replace_placeholder_string_in_files(
+            static_dir,
+            "/PREFECT_UI_SERVE_BASE_REPLACE_PLACEHOLDER",
+            stripped_base_url,
+        )
+
+        # Create a file to indicate that the static files have been copied
+        # This is used to determine if the static files need to be copied again
+        # when the server is restarted
+        with open(os.path.join(static_dir, reference_file_name), "w") as f:
+            f.write(cache_key)
+
+    ui_app.add_middleware(GZipMiddleware)
 
     if (
         os.path.exists(prefect.__ui_static_path__)
         and prefect.settings.PREFECT_UI_ENABLED.value()
         and not ephemeral
     ):
+        # If the static files have already been copied, check if the base_url has changed
+        # If it has, we delete the subpath directory and copy the files again
+        if not reference_file_matches_base_url():
+            create_ui_static_subpath()
+
         ui_app.mount(
-            "/",
-            SPAStaticFiles(directory=prefect.__ui_static_path__),
+            PREFECT_UI_SERVE_BASE.value(),
+            SPAStaticFiles(directory=static_dir),
             name="ui_root",
         )
 
@@ -310,6 +427,7 @@ def _memoize_block_auto_registration(fn: Callable[[], Awaitable[None]]):
     """
     import toml
 
+    import prefect.plugins
     from prefect.blocks.core import Block
     from prefect.server.models.block_registration import _load_collection_blocks_data
     from prefect.utilities.dispatch import get_registry_for_type
@@ -319,6 +437,10 @@ def _memoize_block_auto_registration(fn: Callable[[], Awaitable[None]]):
         if not PREFECT_MEMOIZE_BLOCK_AUTO_REGISTRATION.value():
             await fn(*args, **kwargs)
             return
+
+        # Ensure collections are imported and have the opportunity to register types
+        # before loading the registry
+        prefect.plugins.load_prefect_collections()
 
         blocks_registry = get_registry_for_type(Block)
         collection_blocks_data = await _load_collection_blocks_data()
@@ -346,7 +468,7 @@ def _memoize_block_auto_registration(fn: Callable[[], Awaitable[None]]):
                         )
                     return
         except Exception as exc:
-            logger.warn(
+            logger.warning(
                 ""
                 f"Unable to read memo_store.toml from {PREFECT_MEMO_STORE_PATH} during "
                 f"block auto-registration: {exc!r}.\n"
@@ -357,11 +479,14 @@ def _memoize_block_auto_registration(fn: Callable[[], Awaitable[None]]):
 
         if current_blocks_loading_hash is not None:
             try:
+                if not memo_store_path.exists():
+                    memo_store_path.touch(mode=0o0600)
+
                 memo_store_path.write_text(
                     toml.dumps({"block_auto_registration": current_blocks_loading_hash})
                 )
             except Exception as exc:
-                logger.warn(
+                logger.warning(
                     "Unable to write to memo_store.toml at"
                     f" {PREFECT_MEMO_STORE_PATH} after block auto-registration:"
                     f" {exc!r}.\n Subsequent server start ups will perform block"
@@ -388,7 +513,7 @@ def create_app(
             and services will be disabled.
     """
     settings = settings or prefect.settings.get_current_settings()
-    cache_key = (settings, ephemeral)
+    cache_key = (settings.hash_key(), ephemeral)
 
     if cache_key in APP_CACHE and not ignore_cache:
         return APP_CACHE[cache_key]
@@ -415,11 +540,8 @@ def create_app(
         db = provide_database_interface()
         session = await db.session()
 
-        try:
-            async with session:
-                await run_block_auto_registration(session=session)
-        except Exception as exc:
-            logger.warn(f"Error occurred during block auto-registration: {exc!r}")
+        async with session:
+            await run_block_auto_registration(session=session)
 
     async def start_services():
         """Start additional services when the Prefect REST API starts up."""
@@ -453,6 +575,23 @@ def create_app(
                 services.flow_run_notifications.FlowRunNotifications()
             )
 
+        if prefect.settings.PREFECT_API_SERVICES_FOREMAN_ENABLED.value():
+            service_instances.append(services.foreman.Foreman())
+
+        if prefect.settings.PREFECT_API_SERVICES_TASK_SCHEDULING_ENABLED.value():
+            service_instances.append(services.task_scheduling.TaskSchedulingTimeouts())
+
+        if prefect.settings.PREFECT_API_SERVICES_TRIGGERS_ENABLED.value():
+            service_instances.append(ReactiveTriggers())
+            service_instances.append(ProactiveTriggers())
+            service_instances.append(Actions())
+
+        if prefect.settings.PREFECT_API_SERVICES_EVENT_PERSISTER_ENABLED:
+            service_instances.append(EventPersister())
+
+        if prefect.settings.PREFECT_API_EVENTS_STREAM_OUT_ENABLED:
+            service_instances.append(stream.Distributor())
+
         loop = asyncio.get_running_loop()
 
         app.state.services = {
@@ -465,13 +604,13 @@ def create_app(
 
     async def stop_services():
         """Ensure services are stopped before the Prefect REST API shuts down."""
-        if app.state.services:
+        if hasattr(app.state, "services") and app.state.services:
             await asyncio.gather(*[service.stop() for service in app.state.services])
             try:
                 await asyncio.gather(
                     *[task.stop() for task in app.state.services.values()]
                 )
-            except Exception as exc:
+            except Exception:
                 # `on_service_exit` should handle logging exceptions on exit
                 pass
 
@@ -502,15 +641,17 @@ def create_app(
         version=API_VERSION,
         lifespan=lifespan,
     )
-    api_app = create_orion_api(
+    api_app = create_api_app(
         fast_api_app_kwargs={
             "exception_handlers": {
+                # NOTE: FastAPI special cases the generic `Exception` handler and
+                #       registers it as a separate middleware from the others
                 Exception: custom_internal_exception_handler,
                 RequestValidationError: validation_exception_handler,
                 sa.exc.IntegrityError: integrity_exception_handler,
                 ObjectNotFoundError: prefect_object_not_found_exception_handler,
             }
-        }
+        },
     )
     ui_app = create_ui_app(ephemeral)
 
@@ -522,7 +663,7 @@ def create_app(
         allow_headers=["*"],
     )
 
-    # Limit the number of concurrent requests when using a SQLite datbase to reduce
+    # Limit the number of concurrent requests when using a SQLite database to reduce
     # chance of errors where the database cannot be opened due to a high number of
     # concurrent writes
     if (
@@ -530,9 +671,9 @@ def create_app(
         == "sqlite"
     ):
         app.add_middleware(RequestLimitMiddleware, limit=100)
-        api_app.add_exception_handler(
-            sqlalchemy.exc.OperationalError, db_locked_exception_handler
-        )
+
+    if prefect.settings.PREFECT_SERVER_CSRF_PROTECTION_ENABLED.value():
+        app.add_middleware(api.middleware.CsrfMiddleware)
 
     api_app.mount(
         "/static",
@@ -543,6 +684,7 @@ def create_app(
         ),
         name="static",
     )
+    app.api_app = api_app
     app.mount("/api", app=api_app, name="api")
     app.mount("/", app=ui_app, name="ui")
 

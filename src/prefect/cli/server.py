@@ -1,6 +1,7 @@
 """
 Command line interface for working with Prefect
 """
+
 import os
 import textwrap
 from functools import partial
@@ -14,13 +15,6 @@ from prefect.cli._types import PrefectTyper, SettingsOption
 from prefect.cli._utilities import exit_with_error, exit_with_success
 from prefect.cli.root import app
 from prefect.logging import get_logger
-from prefect.server.database.alembic_commands import (
-    alembic_downgrade,
-    alembic_revision,
-    alembic_stamp,
-    alembic_upgrade,
-)
-from prefect.server.database.dependencies import provide_database_interface
 from prefect.settings import (
     PREFECT_API_SERVICES_LATE_RUNS_ENABLED,
     PREFECT_API_SERVICES_SCHEDULER_ENABLED,
@@ -32,37 +26,21 @@ from prefect.settings import (
     PREFECT_UI_ENABLED,
 )
 from prefect.utilities.asyncutils import run_sync_in_worker_thread
-from prefect.utilities.processutils import run_process, setup_signal_handlers_server
+from prefect.utilities.processutils import (
+    get_sys_executable,
+    run_process,
+    setup_signal_handlers_server,
+)
 
 server_app = PrefectTyper(
     name="server",
-    help="Commands for interacting with the Prefect backend.",
+    help="Commands for interacting with a self-hosted Prefect server instance.",
 )
 database_app = PrefectTyper(
     name="database", help="Commands for interacting with the database."
 )
 server_app.add_typer(database_app)
 app.add_typer(server_app)
-
-# Deprecated compatiblity
-orion_app = PrefectTyper(
-    name="orion",
-    help="Deprecated. Use 'prefect server' instead.",
-    deprecated=True,
-    deprecated_name="prefect orion",
-    deprecated_start_date="Feb 2023",
-    deprecated_help="Use 'prefect server' instead.",
-)
-orion_database_app = PrefectTyper(
-    name="database",
-    help="Deprecated. Use 'prefect server database' instead.",
-    deprecated=True,
-    deprecated_name="prefect orion database",
-    deprecated_start_date="Feb 2023",
-    deprecated_help="Use 'prefect server database' instead.",
-)
-orion_app.add_typer(orion_database_app)
-app.add_typer(orion_app, hidden=True)
 
 logger = get_logger(__name__)
 
@@ -98,7 +76,7 @@ def generate_welcome_blurb(base_url, ui_enabled: bool):
 
     dashboard_disabled = textwrap.dedent(
         """
-        The dashboard is disabled. Set `PREFECT_UI_ENABLED=1` to reenable it.
+        The dashboard is disabled. Set `PREFECT_UI_ENABLED=1` to re-enable it.
         """
     )
 
@@ -112,7 +90,6 @@ def generate_welcome_blurb(base_url, ui_enabled: bool):
     return blurb
 
 
-@orion_app.command()
 @server_app.command()
 async def start(
     host: str = SettingsOption(PREFECT_SERVER_API_HOST),
@@ -126,7 +103,7 @@ async def start(
     late_runs: bool = SettingsOption(PREFECT_API_SERVICES_LATE_RUNS_ENABLED),
     ui: bool = SettingsOption(PREFECT_UI_ENABLED),
 ):
-    """Start a Prefect server"""
+    """Start a Prefect server instance"""
 
     server_env = os.environ.copy()
     server_env["PREFECT_API_SERVICES_SCHEDULER_ENABLED"] = str(scheduler)
@@ -145,6 +122,8 @@ async def start(
             partial(
                 run_process,
                 command=[
+                    get_sys_executable(),
+                    "-m",
                     "uvicorn",
                     "--app-dir",
                     # quote wrapping needed for windows paths with spaces
@@ -177,10 +156,11 @@ async def start(
     app.console.print("Server stopped!")
 
 
-@orion_database_app.command()
 @database_app.command()
 async def reset(yes: bool = typer.Option(False, "--yes", "-y")):
     """Drop and recreate all Prefect database tables"""
+    from prefect.server.database.dependencies import provide_database_interface
+
     db = provide_database_interface()
     engine = await db.engine()
     if not yes:
@@ -197,7 +177,6 @@ async def reset(yes: bool = typer.Option(False, "--yes", "-y")):
     exit_with_success(f'Prefect database "{engine.url!r}" reset!')
 
 
-@orion_database_app.command()
 @database_app.command()
 async def upgrade(
     yes: bool = typer.Option(False, "--yes", "-y"),
@@ -218,6 +197,9 @@ async def upgrade(
     ),
 ):
     """Upgrade the Prefect database"""
+    from prefect.server.database.alembic_commands import alembic_upgrade
+    from prefect.server.database.dependencies import provide_database_interface
+
     db = provide_database_interface()
     engine = await db.engine()
 
@@ -234,16 +216,16 @@ async def upgrade(
     exit_with_success(f"Prefect database at {engine.url!r} upgraded!")
 
 
-@orion_database_app.command()
 @database_app.command()
 async def downgrade(
     yes: bool = typer.Option(False, "--yes", "-y"),
     revision: str = typer.Option(
-        "base",
+        "-1",
         "-r",
         help=(
-            "The revision to pass to `alembic downgrade`. If not provided, runs all"
-            " migrations."
+            "The revision to pass to `alembic downgrade`. If not provided, "
+            "downgrades to the most recent revision. Use 'base' to run all "
+            "migrations."
         ),
     ),
     dry_run: bool = typer.Option(
@@ -255,7 +237,11 @@ async def downgrade(
     ),
 ):
     """Downgrade the Prefect database"""
+    from prefect.server.database.alembic_commands import alembic_downgrade
+    from prefect.server.database.dependencies import provide_database_interface
+
     db = provide_database_interface()
+
     engine = await db.engine()
 
     if not yes:
@@ -274,7 +260,6 @@ async def downgrade(
     exit_with_success(f"Prefect database at {engine.url!r} downgraded!")
 
 
-@orion_database_app.command()
 @database_app.command()
 async def revision(
     message: str = typer.Option(
@@ -286,6 +271,7 @@ async def revision(
     autogenerate: bool = False,
 ):
     """Create a new migration for the Prefect database"""
+    from prefect.server.database.alembic_commands import alembic_revision
 
     app.console.print("Running migration file creation ...")
     await run_sync_in_worker_thread(
@@ -296,10 +282,10 @@ async def revision(
     exit_with_success("Creating new migration file succeeded!")
 
 
-@orion_database_app.command()
 @database_app.command()
 async def stamp(revision: str):
     """Stamp the revision table with the given revision; don't run any migrations"""
+    from prefect.server.database.alembic_commands import alembic_stamp
 
     app.console.print("Stamping database with revision ...")
     await run_sync_in_worker_thread(alembic_stamp, revision=revision)

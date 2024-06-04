@@ -9,7 +9,7 @@ import datetime
 import json
 import re
 import uuid
-from typing import List, Union
+from typing import List, Optional, Union
 
 import pendulum
 import pydantic
@@ -88,7 +88,7 @@ class Timestamp(TypeDecorator):
                     # as alphanumeric comparisons without regard for actual timestamp
                     # semantics or timezones. Therefore, it's important to have uniform
                     # and sortable datetime representations. The default is an ISO8601-compatible
-                    # string with NO time zone and a space (" ") delimeter between the date
+                    # string with NO time zone and a space (" ") delimiter between the date
                     # and the time. The below settings can be used to add a "T" delimiter but
                     # will require all other sqlite datetimes to be set similarly, including
                     # the custom default value for datetime columns and any handwritten SQL
@@ -214,22 +214,25 @@ class Pydantic(TypeDecorator):
         if sa_column_type is not None:
             self.impl = sa_column_type
 
-    def process_bind_param(self, value, dialect):
+    def process_bind_param(self, value, dialect) -> Optional[str]:
         if value is None:
             return None
+
         # parse the value to ensure it complies with the schema
         # (this will raise validation errors if not)
-        value = pydantic.parse_obj_as(self._pydantic_type, value)
+        adapter = pydantic.TypeAdapter(self._pydantic_type)
+        value = adapter.validate_python(value)
+
         # sqlalchemy requires the bind parameter's value to be a python-native
         # collection of JSON-compatible objects. we achieve that by dumping the
         # value to a json string using the pydantic JSON encoder and re-parsing
         # it into a python-native form.
-        return json.loads(json.dumps(value, default=pydantic.json.pydantic_encoder))
+        return adapter.dump_python(value, mode="json")
 
     def process_result_value(self, value, dialect):
         if value is not None:
             # load the json object into a fully hydrated typed object
-            return pydantic.parse_obj_as(self._pydantic_type, value)
+            return pydantic.TypeAdapter(self._pydantic_type).validate_python(value)
 
 
 class now(FunctionElement):
@@ -315,8 +318,7 @@ def _date_add_sqlite(element, compiler, **kwargs):
             sa.func.julianday(dt)
             + (
                 # convert interval to fractional days after the epoch
-                sa.func.julianday(interval)
-                - 2440587.5
+                sa.func.julianday(interval) - 2440587.5
             ),
         )
     )
@@ -419,7 +421,8 @@ def _date_diff_sqlite(element, compiler, **kwargs):
             # the epoch in julian days
             2440587.5
             # plus the date difference in julian days
-            + sa.func.julianday(d1) - sa.func.julianday(d2),
+            + sa.func.julianday(d1)
+            - sa.func.julianday(d2),
         )
     )
 
@@ -494,6 +497,44 @@ def _json_contains_sqlite_fn(left, right, compiler, **kwargs):
 @compiles(json_contains, "sqlite")
 def _json_contains_sqlite(element, compiler, **kwargs):
     return _json_contains_sqlite_fn(element.left, element.right, compiler, **kwargs)
+
+
+class json_extract(FunctionElement):
+    """
+    Platform independent json_extract operator, extracts a value from a JSON
+    field via key.
+
+    On postgres this is equivalent to the ->> operator.
+    https://www.postgresql.org/docs/current/functions-json.html
+    """
+
+    type = sa.Text()
+    name = "json_extract"
+    # see https://docs.sqlalchemy.org/en/14/core/compiler.html#enabling-caching-support-for-custom-constructs
+    inherit_cache = False
+
+    def __init__(self, column: sa.Column, path: str, wrap_quotes: bool = False):
+        self.column = column
+        self.path = path
+        self.wrap_quotes = wrap_quotes
+        super().__init__()
+
+
+@compiles(json_extract, "postgresql")
+@compiles(json_extract)
+def _json_extract_postgresql(element, compiler, **kwargs):
+    return "%s ->> '%s'" % (compiler.process(element.column, **kwargs), element.path)
+
+
+@compiles(json_extract, "sqlite")
+def _json_extract_sqlite(element, compiler, **kwargs):
+    path = element.path.replace("'", "''")  # escape single quotes for JSON path
+    if element.wrap_quotes:
+        path = f'"{path}"'
+    return "JSON_EXTRACT(%s, '$.%s')" % (
+        compiler.process(element.column, **kwargs),
+        path,
+    )
 
 
 class json_has_any_key(FunctionElement):
@@ -615,7 +656,7 @@ def get_dialect(
         from prefect.server.utilities.database import get_dialect
 
         dialect = get_dialect(PREFECT_API_DATABASE_CONNECTION_URL.value())
-        if dialect == "sqlite":
+        if dialect.name == "sqlite":
             print("Using SQLite!")
         else:
             print("Using Postgres!")

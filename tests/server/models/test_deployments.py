@@ -1,21 +1,22 @@
 import datetime
+from typing import List
 from uuid import uuid4
 
 import anyio
 import pendulum
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from prefect.server import models, schemas
+from prefect.server.database import orm_models
 from prefect.server.schemas import filters
 from prefect.server.schemas.states import StateType
 from prefect.settings import PREFECT_API_SERVICES_SCHEDULER_MIN_RUNS
 
 
 class TestCreateDeployment:
-    async def test_create_deployment_succeeds(
-        self, session, flow, infrastructure_document_id
-    ):
+    async def test_create_deployment_succeeds(self, session, flow):
         deployment = await models.deployments.create_deployment(
             session=session,
             deployment=schemas.core.Deployment(
@@ -24,7 +25,6 @@ class TestCreateDeployment:
                 flow_id=flow.id,
                 parameters={"foo": "bar"},
                 tags=["foo", "bar"],
-                infrastructure_document_id=infrastructure_document_id,
             ),
         )
         assert deployment.name == "My Deployment"
@@ -32,11 +32,32 @@ class TestCreateDeployment:
         assert deployment.manifest_path == "file.json"
         assert deployment.parameters == {"foo": "bar"}
         assert deployment.tags == ["foo", "bar"]
-        assert deployment.infrastructure_document_id == infrastructure_document_id
 
-    async def test_creating_a_deployment_creates_associated_work_queue(
+    async def test_creating_a_deployment_with_existing_work_queue_is_ok(
+        self, session, flow, work_queue
+    ):
+        # work_queue fixture creates a work queue with name "wq-1"
+        wq = await models.work_queues.read_work_queue_by_name(
+            session=session, name=work_queue.name
+        )
+        assert wq == work_queue
+
+        await models.deployments.create_deployment(
+            session=session,
+            deployment=schemas.core.Deployment(
+                name="d1",
+                work_queue_name=work_queue.name,
+                flow_id=flow.id,
+                manifest_path="",
+            ),
+        )
+        await session.commit()
+
+    async def test_creating_a_deployment_does_not_create_work_queue(
         self, session, flow
     ):
+        # There was an issue where create_deployment always created a work queue when its name was provided.
+        # This test ensures that this no longer happens. See: https://github.com/PrefectHQ/prefect/pull/9046
         wq = await models.work_queues.read_work_queue_by_name(
             session=session, name="wq-1"
         )
@@ -53,26 +74,7 @@ class TestCreateDeployment:
         wq = await models.work_queues.read_work_queue_by_name(
             session=session, name="wq-1"
         )
-        assert wq is not None
-
-    async def test_creating_a_deployment_with_existing_work_queue_is_ok(
-        self, session, flow
-    ):
-        await models.deployments.create_deployment(
-            session=session,
-            deployment=schemas.core.Deployment(
-                name="d1", work_queue_name="wq-1", flow_id=flow.id, manifest_path=""
-            ),
-        )
-        await session.commit()
-
-        await models.deployments.create_deployment(
-            session=session,
-            deployment=schemas.core.Deployment(
-                name="d2", work_queue_name="wq-1", flow_id=flow.id, manifest_path=""
-            ),
-        )
-        await session.commit()
+        assert wq is None
 
     async def test_create_deployment_with_work_pool(self, session, flow, work_queue):
         deployment = await models.deployments.create_deployment(
@@ -90,8 +92,6 @@ class TestCreateDeployment:
         self,
         session,
         flow,
-        infrastructure_document_id,
-        infrastructure_document_id_2,
     ):
         openapi_schema = {
             "title": "Parameters",
@@ -105,7 +105,6 @@ class TestCreateDeployment:
             deployment=schemas.core.Deployment(
                 name="My Deployment",
                 flow_id=flow.id,
-                infrastructure_document_id=infrastructure_document_id,
                 parameter_openapi_schema=openapi_schema,
             ),
         )
@@ -116,7 +115,6 @@ class TestCreateDeployment:
         assert deployment.parameters == {}
         assert deployment.parameter_openapi_schema == openapi_schema
         assert deployment.tags == []
-        assert deployment.infrastructure_document_id == infrastructure_document_id
 
         await anyio.sleep(1)  # Sleep so update time is easy to differentiate
 
@@ -139,7 +137,6 @@ class TestCreateDeployment:
                 parameters={"foo": "bar"},
                 parameter_openapi_schema=openapi_schema,
                 tags=["foo", "bar"],
-                infrastructure_document_id=infrastructure_document_id_2,
             ),
         )
 
@@ -151,11 +148,8 @@ class TestCreateDeployment:
         assert deployment.parameter_openapi_schema == openapi_schema
         assert deployment.tags == ["foo", "bar"]
         assert deployment.updated > original_update_time
-        assert deployment.infrastructure_document_id == infrastructure_document_id_2
 
-    async def test_create_deployment_with_schedule(
-        self, session, flow, flow_function, infrastructure_document_id
-    ):
+    async def test_create_deployment_with_schedule(self, session, flow, flow_function):
         schedule = schemas.schedules.IntervalSchedule(
             interval=datetime.timedelta(days=1)
         )
@@ -166,14 +160,12 @@ class TestCreateDeployment:
                 flow_id=flow.id,
                 manifest_path="file.json",
                 schedule=schedule,
-                infrastructure_document_id=infrastructure_document_id,
             ),
         )
         assert deployment.name == "My Deployment"
         assert deployment.flow_id == flow.id
         assert deployment.manifest_path == "file.json"
         assert deployment.schedule == schedule
-        assert deployment.infrastructure_document_id == infrastructure_document_id
 
     async def test_create_deployment_with_created_by(self, session, flow):
         created_by = schemas.core.CreatedBy(
@@ -255,9 +247,7 @@ class TestCreateDeployment:
 
 
 class TestReadDeployment:
-    async def test_read_deployment(
-        self, session, flow, flow_function, infrastructure_document_id
-    ):
+    async def test_read_deployment(self, session, flow, flow_function):
         # create a deployment to read
         deployment = await models.deployments.create_deployment(
             session=session,
@@ -265,7 +255,6 @@ class TestReadDeployment:
                 name="My Deployment",
                 manifest_path="file.json",
                 flow_id=flow.id,
-                infrastructure_document_id=infrastructure_document_id,
             ),
         )
         assert deployment.name == "My Deployment"
@@ -282,9 +271,7 @@ class TestReadDeployment:
         )
         assert result is None
 
-    async def test_read_deployment_by_name(
-        self, session, flow, flow_function, infrastructure_document_id
-    ):
+    async def test_read_deployment_by_name(self, session, flow, flow_function):
         # create a deployment to read
         deployment = await models.deployments.create_deployment(
             session=session,
@@ -292,7 +279,6 @@ class TestReadDeployment:
                 name="My Deployment",
                 manifest_path="file.json",
                 flow_id=flow.id,
-                infrastructure_document_id=infrastructure_document_id,
             ),
         )
         assert deployment.name == "My Deployment"
@@ -306,7 +292,7 @@ class TestReadDeployment:
         assert deployment.name == read_deployment.name
 
     async def test_read_deployment_by_name_does_not_return_deployments_from_other_flows(
-        self, session, flow_function, infrastructure_document_id
+        self, session, flow_function
     ):
         flow_1, flow_2 = [
             await models.flows.create_flow(
@@ -321,16 +307,14 @@ class TestReadDeployment:
                 name="My Deployment",
                 manifest_path="file.json",
                 flow_id=flow_1.id,
-                infrastructure_document_id=infrastructure_document_id,
             ),
         )
-        deployment_2 = await models.deployments.create_deployment(
+        await models.deployments.create_deployment(
             session=session,
             deployment=schemas.core.Deployment(
                 name="My Deployment",
                 manifest_path="file.json",
                 flow_id=flow_2.id,
-                infrastructure_document_id=infrastructure_document_id,
             ),
         )
 
@@ -374,7 +358,6 @@ class TestReadDeployments:
         deployment_id_1,
         deployment_id_2,
         deployment_id_3,
-        infrastructure_document_id,
     ):
         await models.deployments.create_deployment(
             session=session,
@@ -383,8 +366,8 @@ class TestReadDeployments:
                 name="My Deployment",
                 manifest_path="file.json",
                 flow_id=flow.id,
+                paused=False,
                 is_schedule_active=True,
-                infrastructure_document_id=infrastructure_document_id,
             ),
         )
         await models.deployments.create_deployment(
@@ -395,8 +378,8 @@ class TestReadDeployments:
                 manifest_path="file.json",
                 flow_id=flow.id,
                 tags=["tb12"],
+                paused=False,
                 is_schedule_active=True,
-                infrastructure_document_id=infrastructure_document_id,
             ),
         )
         await models.deployments.create_deployment(
@@ -407,6 +390,7 @@ class TestReadDeployments:
                 manifest_path="file.json",
                 flow_id=flow.id,
                 tags=["tb12", "goat"],
+                paused=True,
                 is_schedule_active=False,
             ),
         )
@@ -455,6 +439,17 @@ class TestReadDeployments:
             ),
         )
         assert {res.id for res in result} == {deployment_id_2}
+
+    async def test_read_deployment_filters_by_paused(
+        self, filter_data, deployment_id_3, session
+    ):
+        result = await models.deployments.read_deployments(
+            session=session,
+            deployment_filter=filters.DeploymentFilter(
+                paused=filters.DeploymentFilterPaused(eq_=True)
+            ),
+        )
+        assert {res.id for res in result} == {deployment_id_3}
 
     async def test_read_deployment_filters_by_schedule_active(
         self, filter_data, deployment_id_3, session
@@ -590,14 +585,16 @@ class TestDeleteDeployment:
 
 
 class TestScheduledRuns:
-    async def test_schedule_runs_inserts_in_db(self, flow, deployment, session, db):
+    async def test_schedule_runs_inserts_in_db(self, deployment, session):
         scheduled_runs = await models.deployments.schedule_runs(
             session, deployment_id=deployment.id
         )
         assert len(scheduled_runs) == PREFECT_API_SERVICES_SCHEDULER_MIN_RUNS.value()
         query_result = await session.execute(
-            sa.select(db.FlowRun).where(
-                db.FlowRun.state.has(db.FlowRunState.type == StateType.SCHEDULED)
+            sa.select(orm_models.FlowRun).where(
+                orm_models.FlowRun.state.has(
+                    orm_models.FlowRunState.type == StateType.SCHEDULED
+                )
             )
         )
 
@@ -617,7 +614,7 @@ class TestScheduledRuns:
             actual_times.add(run.state.state_details.scheduled_time)
         assert actual_times == expected_times
 
-    async def test_schedule_runs_is_idempotent(self, flow, deployment, session, db):
+    async def test_schedule_runs_is_idempotent(self, flow, deployment, session):
         scheduled_runs = await models.deployments.schedule_runs(
             session, deployment_id=deployment.id
         )
@@ -631,9 +628,11 @@ class TestScheduledRuns:
 
         # only max runs runs were inserted
         query_result = await session.execute(
-            sa.select(db.FlowRun).where(
-                db.FlowRun.flow_id == flow.id,
-                db.FlowRun.state.has(db.FlowRunState.type == StateType.SCHEDULED),
+            sa.select(orm_models.FlowRun).where(
+                orm_models.FlowRun.flow_id == flow.id,
+                orm_models.FlowRun.state.has(
+                    orm_models.FlowRunState.type == StateType.SCHEDULED
+                ),
             )
         )
 
@@ -662,30 +661,6 @@ class TestScheduledRuns:
         )
         assert scheduled_runs == []
 
-    async def test_schedule_runs_respects_infrastructure(
-        self, flow, flow_function, session, infrastructure_document_id
-    ):
-        deployment = await models.deployments.create_deployment(
-            session=session,
-            deployment=schemas.core.Deployment(
-                name="My Deployment",
-                manifest_path="file.json",
-                schedule=schemas.schedules.IntervalSchedule(
-                    interval=datetime.timedelta(days=1)
-                ),
-                flow_id=flow.id,
-                infrastructure_document_id=infrastructure_document_id,
-            ),
-        )
-        scheduled_runs = await models.deployments.schedule_runs(
-            session, deployment_id=deployment.id, max_runs=1
-        )
-        assert len(scheduled_runs) == 1
-        scheduled_run = await models.flow_runs.read_flow_run(
-            session=session, flow_run_id=scheduled_runs[0]
-        )
-        assert scheduled_run.infrastructure_document_id == infrastructure_document_id
-
     @pytest.mark.parametrize("tags", [[], ["foo"]])
     async def test_schedule_runs_applies_tags(self, tags, flow, flow_function, session):
         deployment = await models.deployments.create_deployment(
@@ -693,9 +668,14 @@ class TestScheduledRuns:
             deployment=schemas.core.Deployment(
                 name="My Deployment",
                 manifest_path="file.json",
-                schedule=schemas.schedules.IntervalSchedule(
-                    interval=datetime.timedelta(days=1)
-                ),
+                schedules=[
+                    schemas.core.DeploymentSchedule(
+                        schedule=schemas.schedules.IntervalSchedule(
+                            interval=datetime.timedelta(days=1)
+                        ),
+                        active=True,
+                    ),
+                ],
                 flow_id=flow.id,
                 tags=tags,
             ),
@@ -719,9 +699,14 @@ class TestScheduledRuns:
             deployment=schemas.core.Deployment(
                 name="My Deployment",
                 manifest_path="file.json",
-                schedule=schemas.schedules.IntervalSchedule(
-                    interval=datetime.timedelta(days=1)
-                ),
+                schedules=[
+                    schemas.core.DeploymentSchedule(
+                        schedule=schemas.schedules.IntervalSchedule(
+                            interval=datetime.timedelta(days=1)
+                        ),
+                        active=True,
+                    ),
+                ],
                 flow_id=flow.id,
                 tags=tags,
             ),
@@ -746,9 +731,14 @@ class TestScheduledRuns:
             deployment=schemas.core.Deployment(
                 name="My Deployment",
                 manifest_path="file.json",
-                schedule=schemas.schedules.IntervalSchedule(
-                    interval=datetime.timedelta(days=1)
-                ),
+                schedules=[
+                    schemas.core.DeploymentSchedule(
+                        schedule=schemas.schedules.IntervalSchedule(
+                            interval=datetime.timedelta(days=1)
+                        ),
+                        active=True,
+                    ),
+                ],
                 flow_id=flow.id,
                 work_queue_name="wq-test-runs",
             ),
@@ -772,9 +762,14 @@ class TestScheduledRuns:
             deployment=schemas.core.Deployment(
                 name="My Deployment",
                 manifest_path="file.json",
-                schedule=schemas.schedules.IntervalSchedule(
-                    interval=datetime.timedelta(days=1)
-                ),
+                schedules=[
+                    schemas.core.DeploymentSchedule(
+                        schedule=schemas.schedules.IntervalSchedule(
+                            interval=datetime.timedelta(days=1)
+                        ),
+                        active=True,
+                    ),
+                ],
                 flow_id=flow.id,
                 parameters=parameters,
             ),
@@ -907,7 +902,7 @@ class TestScheduledRuns:
     async def test_scheduling_multiple_batches_correctly_updates_runs(
         self, session, deployment, flow_function, flow, db
     ):
-        # ensures that updating flow run states works correctly and doesnt set
+        # ensures that updating flow run states works correctly and doesn't set
         # any to None inadvertently
         deployment_2 = await models.deployments.create_deployment(
             session=session,
@@ -922,7 +917,7 @@ class TestScheduledRuns:
         )
 
         # delete all runs
-        await session.execute(sa.delete(db.FlowRun))
+        await session.execute(sa.delete(orm_models.FlowRun))
 
         # schedule runs
         await models.deployments.schedule_runs(
@@ -930,7 +925,9 @@ class TestScheduledRuns:
         )
 
         result = await session.execute(
-            sa.select(sa.func.count(db.FlowRun.id)).where(db.FlowRun.state_id.is_(None))
+            sa.select(sa.func.count(orm_models.FlowRun.id)).where(
+                orm_models.FlowRun.state_id.is_(None)
+            )
         )
         # no runs with missing states
         assert result.scalar() == 0
@@ -941,7 +938,9 @@ class TestScheduledRuns:
         )
 
         result = await session.execute(
-            sa.select(sa.func.count(db.FlowRun.id)).where(db.FlowRun.state_id.is_(None))
+            sa.select(sa.func.count(orm_models.FlowRun.id)).where(
+                orm_models.FlowRun.state_id.is_(None)
+            )
         )
         # no runs with missing states
         assert result.scalar() == 0
@@ -1038,3 +1037,277 @@ class TestUpdateDeployment:
             session=session, work_queue_id=updated_deployment.work_queue_id
         )
         assert work_queue.name == "new-work-pool-queue"
+
+    async def test_updating_deployment_does_not_duplicate_work_queue(
+        self,
+        session,
+        deployment,
+        work_pool,
+    ):
+        # There was an issue where update_deployment would always create a work_queue in the default pool when
+        # a work_queue_name was provided. This also happened when the work_pool_name was provided. In case of
+        # the latter, the work_queue should only have been created in the specified pool, not duplicated in
+        # the default pool.
+        # This test ensures that this no longer happens. See: https://github.com/PrefectHQ/prefect/pull/9046
+
+        new_queue_name = "new-work-queue-name"
+
+        # Assert queue does not exist before update_deployment
+        wq = await models.workers.read_work_queue_by_name(
+            session=session,
+            work_pool_name=models.workers.DEFAULT_AGENT_WORK_POOL_NAME,
+            work_queue_name=new_queue_name,
+        )
+        assert wq is None
+
+        wq = await models.workers.read_work_queue_by_name(
+            session=session,
+            work_pool_name=work_pool.name,
+            work_queue_name=new_queue_name,
+        )
+        assert wq is None
+
+        await models.deployments.update_deployment(
+            session=session,
+            deployment_id=deployment.id,
+            deployment=schemas.actions.DeploymentUpdate(
+                work_queue_name=new_queue_name,
+                work_pool_name=work_pool.name,
+            ),
+        )
+        await session.commit()
+
+        # Assert it only exists in the custom work pool, not also in the default pool
+        wq = await models.workers.read_work_queue_by_name(
+            session=session,
+            work_pool_name=models.workers.DEFAULT_AGENT_WORK_POOL_NAME,
+            work_queue_name=new_queue_name,
+        )
+        assert wq is None
+
+        wq = await models.workers.read_work_queue_by_name(
+            session=session,
+            work_pool_name=work_pool.name,
+            work_queue_name=new_queue_name,
+        )
+        assert wq is not None
+        assert wq.work_pool == work_pool
+
+
+@pytest.fixture
+async def deployment_schedules(
+    session: AsyncSession,
+    deployment,
+) -> List[schemas.core.DeploymentSchedule]:
+    await models.deployments.delete_schedules_for_deployment(
+        session=session, deployment_id=deployment.id
+    )
+
+    schedules = [
+        schemas.actions.DeploymentScheduleCreate(
+            schedule=schemas.schedules.IntervalSchedule(
+                interval=datetime.timedelta(days=1)
+            ),
+            active=True,
+        ),
+        schemas.actions.DeploymentScheduleCreate(
+            schedule=schemas.schedules.IntervalSchedule(
+                interval=datetime.timedelta(days=2)
+            ),
+            active=False,
+        ),
+        schemas.actions.DeploymentScheduleCreate(
+            schedule=schemas.schedules.IntervalSchedule(
+                interval=datetime.timedelta(days=3)
+            ),
+            active=True,
+        ),
+    ]
+
+    created = await models.deployments.create_deployment_schedules(
+        session=session,
+        schedules=schedules,
+        deployment_id=deployment.id,
+    )
+
+    return created
+
+
+class TestDeploymentSchedules:
+    async def test_can_create_schedules(
+        self,
+        session,
+        deployment,
+    ):
+        schedules = [
+            schemas.actions.DeploymentScheduleCreate(
+                schedule=schemas.schedules.IntervalSchedule(
+                    interval=datetime.timedelta(days=1)
+                ),
+                active=True,
+            ),
+            schemas.actions.DeploymentScheduleCreate(
+                schedule=schemas.schedules.IntervalSchedule(
+                    interval=datetime.timedelta(days=2)
+                ),
+                active=False,
+            ),
+        ]
+
+        created = await models.deployments.create_deployment_schedules(
+            session=session,
+            schedules=schedules,
+            deployment_id=deployment.id,
+        )
+
+        assert len(created) == 2
+
+        assert created[0].deployment_id == deployment.id
+        assert created[0].schedule == schedules[0].schedule
+        assert created[0].active == schedules[0].active
+
+        assert created[1].deployment_id == deployment.id
+        assert created[1].schedule == schedules[1].schedule
+        assert created[1].active == schedules[1].active
+
+    async def test_can_read_schedules(
+        self,
+        session: AsyncSession,
+        deployment,
+        deployment_schedules: List[schemas.core.DeploymentSchedule],
+    ):
+        schedules = await models.deployments.read_deployment_schedules(
+            session=session,
+            deployment_id=deployment.id,
+        )
+
+        existing = {s.id for s in deployment_schedules}
+        assert {s.id for s in schedules} == existing
+
+    async def test_read_can_filter_by_active(
+        self,
+        session: AsyncSession,
+        deployment,
+        deployment_schedules: List[schemas.core.DeploymentSchedule],
+    ):
+        schedules = await models.deployments.read_deployment_schedules(
+            session=session,
+            deployment_id=deployment.id,
+            deployment_schedule_filter=schemas.filters.DeploymentScheduleFilter(
+                active=schemas.filters.DeploymentScheduleFilterActive(eq_=False)
+            ),
+        )
+
+        assert len(schedules) > 0
+        assert len(schedules) < len(deployment_schedules)
+        assert all(s.active is False for s in schedules)
+
+    async def test_can_update_schedule(
+        self,
+        session: AsyncSession,
+        deployment,
+        deployment_schedules: List[schemas.core.DeploymentSchedule],
+    ):
+        assert deployment_schedules[0].active is True
+
+        assert await models.deployments.update_deployment_schedule(
+            session=session,
+            deployment_id=deployment.id,
+            deployment_schedule_id=deployment_schedules[0].id,
+            schedule=schemas.actions.DeploymentScheduleUpdate(active=False),
+        )
+
+        schedules = await models.deployments.read_deployment_schedules(
+            session=session,
+            deployment_id=deployment.id,
+        )
+
+        the_one = next(
+            schedule
+            for schedule in schedules
+            if schedule.id == deployment_schedules[0].id
+        )
+
+        assert the_one.active is False
+
+    async def test_cannot_update_schedule_incorrect_deployment_id(
+        self,
+        session: AsyncSession,
+        deployment_2,
+        deployment_schedules: List[schemas.core.DeploymentSchedule],
+    ):
+        assert deployment_schedules[0].active is True
+        assert deployment_schedules[0].deployment_id != deployment_2.id
+
+        # As a security measure we require that the deployment_id also be
+        # passed into the update call to prevent a user from updating a
+        # schedule for a different deployment.
+        result = await models.deployments.update_deployment_schedule(
+            session=session,
+            deployment_id=deployment_2.id,
+            deployment_schedule_id=deployment_schedules[0].id,
+            schedule=schemas.actions.DeploymentScheduleUpdate(active=False),
+        )
+
+        assert result is False
+
+    async def test_can_delete_schedule(
+        self,
+        session: AsyncSession,
+        deployment,
+        deployment_schedules: List[schemas.core.DeploymentSchedule],
+    ):
+        assert await models.deployments.delete_deployment_schedule(
+            session=session,
+            deployment_id=deployment.id,
+            deployment_schedule_id=deployment_schedules[0].id,
+        )
+
+        schedules = await models.deployments.read_deployment_schedules(
+            session=session,
+            deployment_id=deployment.id,
+        )
+
+        assert deployment_schedules[0].id not in {s.id for s in schedules}
+
+    async def test_cannot_delete_schedule_incorrect_deployment_id(
+        self,
+        session: AsyncSession,
+        deployment_2,
+        deployment_schedules: List[schemas.core.DeploymentSchedule],
+    ):
+        assert deployment_schedules[0].active is True
+        assert deployment_schedules[0].deployment_id != deployment_2.id
+
+        # As a security measure we require that the deployment_id also be
+        # passed into the delete call to prevent a user from updating a
+        # schedule for a different deployment.
+        result = await models.deployments.delete_deployment_schedule(
+            session=session,
+            deployment_id=deployment_2.id,
+            deployment_schedule_id=deployment_schedules[0].id,
+        )
+        assert result is False
+
+    async def test_can_delete_all_schedules(
+        self,
+        session: AsyncSession,
+        deployment,
+        deployment_schedules: List[schemas.core.DeploymentSchedule],
+    ):
+        schedules = await models.deployments.read_deployment_schedules(
+            session=session,
+            deployment_id=deployment.id,
+        )
+        assert len(schedules) == len(deployment_schedules) > 0
+
+        assert await models.deployments.delete_schedules_for_deployment(
+            session=session,
+            deployment_id=deployment.id,
+        )
+
+        schedules = await models.deployments.read_deployment_schedules(
+            session=session,
+            deployment_id=deployment.id,
+        )
+        assert len(schedules) == 0

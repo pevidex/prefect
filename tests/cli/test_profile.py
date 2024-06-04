@@ -290,7 +290,7 @@ def test_ls_respects_current_from_context():
 def test_create_profile():
     invoke_and_assert(
         ["profile", "create", "foo"],
-        expected_output=f"""
+        expected_output="""
             Created profile with properties:
                 name - 'foo'
                 from name - None
@@ -321,7 +321,7 @@ def test_create_profile_from_existing():
 
     invoke_and_assert(
         ["profile", "create", "bar", "--from", "foo"],
-        expected_output=f"""
+        expected_output="""
             Created profile with properties:
                 name - 'bar'
                 from name - foo
@@ -376,7 +376,9 @@ def test_delete_profile():
     )
 
     invoke_and_assert(
-        ["profile", "delete", "bar"], expected_output="Removed profile 'bar'."
+        ["profile", "delete", "bar"],
+        user_input="y",
+        expected_output_contains="Removed profile 'bar'.",
     )
 
     profiles = load_profiles()
@@ -395,7 +397,9 @@ def test_delete_profile_default_is_reset():
     )
 
     invoke_and_assert(
-        ["profile", "delete", "default"], expected_output="Reset profile 'default'."
+        ["profile", "delete", "default"],
+        user_input="y",
+        expected_output_contains="Reset profile 'default'.",
     )
 
     profiles = load_profiles()

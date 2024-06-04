@@ -1,6 +1,7 @@
 """
 Command line interface for working with Prefect Server
 """
+
 import json
 import os
 import platform
@@ -11,7 +12,6 @@ import textwrap
 import time
 from functools import partial
 from string import Template
-from typing import List
 
 import anyio
 import typer
@@ -19,17 +19,12 @@ import typer
 import prefect
 from prefect.cli._types import PrefectTyper, SettingsOption
 from prefect.cli._utilities import exit_with_error, exit_with_success
-from prefect.cli.agent import start as start_agent
 from prefect.cli.root import app
-from prefect.docker import get_prefect_image_name, python_version_minor
-from prefect.server.api.server import create_app
 from prefect.settings import (
-    PREFECT_API_URL,
-    PREFECT_CLI_COLORS,
-    PREFECT_CLI_WRAP_LINES,
     PREFECT_SERVER_API_HOST,
     PREFECT_SERVER_API_PORT,
 )
+from prefect.utilities.dockerutils import get_prefect_image_name, python_version_minor
 from prefect.utilities.filesystem import tmpchdir
 from prefect.utilities.processutils import run_process
 
@@ -58,60 +53,6 @@ def exit_with_error_if_not_editable_install():
         )
 
 
-def agent_process_entrypoint(**kwargs):
-    """
-    An entrypoint for starting an agent in a subprocess. Adds a Rich console
-    to the Typer app, processes Typer default parameters, then starts an agent.
-    All kwargs are forwarded to  `prefect.cli.agent.start`.
-    """
-    import inspect
-
-    import rich
-
-    # import locally so only the `dev` command breaks if Typer internals change
-    from typer.models import ParameterInfo
-
-    # Typer does not process default parameters when calling a function
-    # directly, so we must set `start_agent`'s default parameters manually.
-    # get the signature of the `start_agent` function
-    start_agent_signature = inspect.signature(start_agent)
-
-    # for any arguments not present in kwargs, use the default value.
-    for name, param in start_agent_signature.parameters.items():
-        if name not in kwargs:
-            # All `param.default` values for start_agent are Typer params that store the
-            # actual default value in their `default` attribute and we must call
-            # `param.default.default` to get the actual default value. We should also
-            # ensure we extract the right default if non-Typer defaults are added
-            # to `start_agent` in the future.
-            if isinstance(param.default, ParameterInfo):
-                default = param.default.default
-            else:
-                default = param.default
-
-            # Some defaults are Prefect `SettingsOption.value` methods
-            # that must be called to get the actual value.
-            kwargs[name] = default() if callable(default) else default
-
-    # add a console, because calling the agent start function directly
-    # instead of via CLI call means `app` has no `console` attached.
-    app.console = (
-        rich.console.Console(
-            highlight=False,
-            color_system="auto" if PREFECT_CLI_COLORS else None,
-            soft_wrap=not PREFECT_CLI_WRAP_LINES.value(),
-        )
-        if not getattr(app, "console", None)
-        else app.console
-    )
-
-    try:
-        start_agent(**kwargs)  # type: ignore
-    except KeyboardInterrupt:
-        # expected when watchfiles kills the process
-        pass
-
-
 @dev_app.command()
 def build_docs(
     schema_path: str = None,
@@ -120,6 +61,9 @@ def build_docs(
     Builds REST API reference documentation for static display.
     """
     exit_with_error_if_not_editable_install()
+
+    from prefect.server.api.server import create_app
+
     schema = create_app(ephemeral=True).openapi()
 
     if not schema_path:
@@ -143,10 +87,12 @@ Requires npm.
 
 
 @dev_app.command(help=BUILD_UI_HELP)
-def build_ui():
+def build_ui(
+    no_install: bool = False,
+):
     exit_with_error_if_not_editable_install()
-    with tmpchdir(prefect.__development_base_path__):
-        with tmpchdir(prefect.__development_base_path__ / "ui"):
+    with tmpchdir(prefect.__development_base_path__ / "ui"):
+        if not no_install:
             app.console.print("Installing npm packages...")
             try:
                 subprocess.check_output(["npm", "ci"], shell=sys.platform == "win32")
@@ -155,14 +101,13 @@ def build_ui():
                     "npm call failed - try running `nvm use` first.", style="red"
                 )
                 raise
-
             app.console.print("Building for distribution...")
             env = os.environ.copy()
-            env["PREFECT_UI_SERVE_BASE"] = "/"
             subprocess.check_output(
                 ["npm", "run", "build"], env=env, shell=sys.platform == "win32"
             )
 
+    with tmpchdir(prefect.__development_base_path__):
         if os.path.exists(prefect.__ui_static_path__):
             app.console.print("Removing existing build files...")
             shutil.rmtree(prefect.__ui_static_path__)
@@ -179,13 +124,12 @@ async def ui():
     Starts a hot-reloading development UI.
     """
     exit_with_error_if_not_editable_install()
-    with tmpchdir(prefect.__development_base_path__):
-        with tmpchdir(prefect.__development_base_path__ / "ui"):
-            app.console.print("Installing npm packages...")
-            await run_process(["npm", "install"], stream_output=True)
+    with tmpchdir(prefect.__development_base_path__ / "ui"):
+        app.console.print("Installing npm packages...")
+        await run_process(["npm", "install"], stream_output=True)
 
-            app.console.print("Starting UI development server...")
-            await run_process(command=["npm", "run", "serve"], stream_output=True)
+        app.console.print("Starting UI development server...")
+        await run_process(command=["npm", "run", "serve"], stream_output=True)
 
 
 @dev_app.command()
@@ -206,6 +150,8 @@ async def api(
     server_env["PREFECT_UI_API_URL"] = f"http://{host}:{port}/api"
 
     command = [
+        sys.executable,
+        "-m",
         "uvicorn",
         "--factory",
         "prefect.server.api.server:create_app",
@@ -229,7 +175,8 @@ async def api(
         try:
             server_pid = await tg.start(start_command)
             async for _ in watchfiles.awatch(
-                prefect.__module_path__, stop_event=stop_event  # type: ignore
+                prefect.__module_path__,
+                stop_event=stop_event,  # type: ignore
             ):
                 # when any watched files change, restart the server
                 app.console.print("Restarting Prefect Server...")
@@ -254,47 +201,9 @@ async def api(
 
 
 @dev_app.command()
-async def agent(
-    api_url: str = SettingsOption(PREFECT_API_URL),
-    work_queues: List[str] = typer.Option(
-        ["default"],
-        "-q",
-        "--work-queue",
-        help="One or more work queue names for the agent to pull from.",
-    ),
-):
-    """
-    Starts a hot-reloading development agent process.
-    """
-    # Delayed import since this is only a 'dev' dependency
-    import watchfiles
-
-    app.console.print("Creating hot-reloading agent process...")
-
-    try:
-        await watchfiles.arun_process(
-            prefect.__module_path__,
-            target=agent_process_entrypoint,
-            kwargs=dict(api=api_url, work_queues=work_queues),
-        )
-    except RuntimeError as err:
-        # a bug in watchfiles causes an 'Already borrowed' error from Rust when
-        # exiting: https://github.com/samuelcolvin/watchfiles/issues/200
-        if str(err).strip() != "Already borrowed":
-            raise
-
-
-@dev_app.command()
 async def start(
     exclude_api: bool = typer.Option(False, "--no-api"),
     exclude_ui: bool = typer.Option(False, "--no-ui"),
-    exclude_agent: bool = typer.Option(False, "--no-agent"),
-    work_queues: List[str] = typer.Option(
-        ["default"],
-        "-q",
-        "--work-queue",
-        help="One or more work queue names for the dev agent to pull from.",
-    ),
 ):
     """
     Starts a hot-reloading development server with API, UI, and agent processes.
@@ -306,20 +215,16 @@ async def start(
         if not exclude_api:
             tg.start_soon(
                 partial(
-                    api,
+                    # CLI commands are wrapped in sync_compatible, but this
+                    # task group is async, so we need use the wrapped function
+                    # directly
+                    api.aio,
                     host=PREFECT_SERVER_API_HOST.value(),
                     port=PREFECT_SERVER_API_PORT.value(),
                 )
             )
         if not exclude_ui:
-            tg.start_soon(ui)
-        if not exclude_agent:
-            # Hook the agent to the hosted API if running
-            if not exclude_api:
-                host = f"http://{PREFECT_SERVER_API_HOST.value()}:{PREFECT_SERVER_API_PORT.value()}/api"  # noqa
-            else:
-                host = PREFECT_API_URL.value()
-            tg.start_soon(agent, host, work_queues)
+            tg.start_soon(ui.aio)
 
 
 @dev_app.command()
@@ -353,7 +258,7 @@ def build_image(
     Build a docker image for development.
     """
     exit_with_error_if_not_editable_install()
-    # TODO: Once https://github.com/tiangolo/typer/issues/354 is addresesd, the
+    # TODO: Once https://github.com/tiangolo/typer/issues/354 is addressed, the
     #       default can be set in the function signature
     arch = arch or platform.machine()
     python_version = python_version or python_version_minor()

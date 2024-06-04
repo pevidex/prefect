@@ -15,9 +15,12 @@ from prefect.server.database.orm_models import (
     AioSqliteORMConfiguration,
     AsyncPostgresORMConfiguration,
 )
+from prefect.server.models.variables import read_variables
 from prefect.server.utilities.database import get_dialect
 from prefect.settings import PREFECT_API_DATABASE_CONNECTION_URL
 from prefect.utilities.asyncutils import run_sync_in_worker_thread
+
+pytestmark = pytest.mark.service("database")
 
 
 @pytest.fixture
@@ -33,14 +36,13 @@ async def sample_db_data(
     """Adds sample data to the database for testing migrations"""
 
 
-@pytest.mark.service("database")
 @pytest.mark.timeout(120)
 async def test_orion_full_migration_works_with_data_in_db(sample_db_data):
     """
     Tests that downgrade migrations work when the database has data in it.
     """
     try:
-        await run_sync_in_worker_thread(alembic_downgrade)
+        await run_sync_in_worker_thread(alembic_downgrade, revision="base")
     finally:
         await run_sync_in_worker_thread(alembic_upgrade)
 
@@ -329,6 +331,7 @@ async def test_backfill_artifacts(db):
         await run_sync_in_worker_thread(alembic_upgrade)
 
 
+@pytest.mark.timeout(120)
 async def test_adding_work_pool_tables_does_not_remove_fks(db, flow):
     """
     Tests state_name is backfilled correctly for the flow_run
@@ -506,8 +509,8 @@ async def test_adding_default_agent_pool_with_existing_default_queue_migration(
             deployment = (
                 await session.execute(
                     sa.text(
-                        f"SELECT work_queue_id FROM deployment WHERE name ="
-                        f" 'my-deployment';"
+                        "SELECT work_queue_id FROM deployment WHERE name ="
+                        " 'my-deployment';"
                     )
                 )
             ).fetchone()
@@ -587,4 +590,153 @@ async def test_adding_default_agent_pool_without_existing_default_queue_migratio
             )
 
     finally:
+        await run_sync_in_worker_thread(alembic_upgrade)
+
+
+async def test_not_adding_default_agent_pool_when_all_work_queues_have_work_pool(db):
+    connection_url = PREFECT_API_DATABASE_CONNECTION_URL.value()
+    dialect = get_dialect(connection_url)
+
+    # get the proper migration revisions
+    if dialect.name == "postgresql":
+        revisions = ("0a1250a5aa25", "f98ae6d8e2cc")
+    else:
+        revisions = ("b9bda9f142f1", "1678f2fb8b33")
+
+    try:
+        await run_sync_in_worker_thread(alembic_downgrade, revision=revisions[0])
+
+        session = await db.session()
+        async with session:
+            # clear the work queue table
+            await session.execute(sa.text("DELETE FROM work_queue;"))
+            await session.commit()
+
+            # insert some work queues with a work pool into the database
+            await session.execute(
+                sa.text(
+                    "INSERT INTO work_pool (name, type) VALUES ('existing-pool', 'prefect-agent');"
+                )
+            )
+            existing_pool_id = (
+                await session.execute(
+                    sa.text("SELECT id FROM work_pool WHERE name = 'existing-pool';")
+                )
+            ).scalar()
+
+            await session.execute(
+                sa.text(
+                    "INSERT INTO work_queue (name, work_pool_id) VALUES ('queue-1', :existing_pool_id);"
+                ),
+                {"existing_pool_id": existing_pool_id},
+            )
+            await session.execute(
+                sa.text(
+                    "INSERT INTO work_queue (name, work_pool_id) VALUES ('queue-2', :existing_pool_id);"
+                ),
+                {"existing_pool_id": existing_pool_id},
+            )
+            await session.execute(
+                sa.text(
+                    "INSERT INTO work_queue (name, work_pool_id) VALUES ('queue-3', :existing_pool_id);"
+                ),
+                {"existing_pool_id": existing_pool_id},
+            )
+            await session.commit()
+
+        async with session:
+            # Confirm the work queues are present
+            pre_work_queue_names = (
+                await session.execute(sa.text("SELECT name FROM work_queue;"))
+            ).fetchall()
+
+            assert len(pre_work_queue_names) == 3
+
+        # run the migration
+        await run_sync_in_worker_thread(alembic_upgrade, revision=revisions[1])
+
+        session = await db.session()
+        async with session:
+            # Check that the default-agent-pool is not created
+            default_pool_exists = (
+                await session.execute(
+                    sa.text(
+                        "SELECT COUNT(*) FROM work_pool WHERE name = 'default-agent-pool';"
+                    )
+                )
+            ).scalar()
+
+            assert default_pool_exists == 0
+
+            # Check that the existing work queues are not modified
+            work_queue_names = (
+                await session.execute(sa.text("SELECT name FROM work_queue;"))
+            ).fetchall()
+
+            assert len(work_queue_names) == 3
+            assert set(work_queue_names) == set(pre_work_queue_names)
+
+    finally:
+        await run_sync_in_worker_thread(alembic_upgrade)
+
+
+async def test_migrate_variables_to_json(db):
+    connection_url = PREFECT_API_DATABASE_CONNECTION_URL.value()
+    dialect = get_dialect(connection_url)
+
+    # get the proper migration revisions
+    if dialect.name == "postgresql":
+        revisions = ("b23c83a12cb4", "94622c1663e8")
+    else:
+        revisions = ("20fbd53b3cef", "2ac65f1758c2")
+
+    try:
+        await run_sync_in_worker_thread(alembic_downgrade, revision=revisions[0])
+
+        session = await db.session()
+        async with session:
+            # clear the variables table
+            await session.execute(sa.text("DELETE FROM variable;"))
+
+            await session.execute(
+                sa.text(
+                    """INSERT INTO variable (name, value) VALUES ('var1', 'value1'), ('var2', '"value2"'), ('var3', '\"value3\"')"""
+                )
+            )
+
+            await session.commit()
+
+            variable_values = (
+                await session.execute(sa.text("SELECT value FROM variable;"))
+            ).fetchall()
+
+            values = {value[0] for value in variable_values}
+            assert values == {"value1", '"value2"', '"value3"'}
+
+        # run the upgrade
+        await run_sync_in_worker_thread(alembic_upgrade, revision=revisions[1])
+
+        # string values should be able to be read as json
+        # but parsed as strings on read from the models layer
+        async with session:
+            variables = await read_variables(session)
+            values = {variable.value for variable in variables}
+            assert values == {"value1", '"value2"', '"value3"'}
+
+        # reverse the migration
+        await run_sync_in_worker_thread(alembic_downgrade, revision=revisions[0])
+
+        # original string values should be present
+        async with session:
+            variable_values = (
+                await session.execute(sa.text("SELECT value FROM variable;"))
+            ).fetchall()
+
+            values = {value[0] for value in variable_values}
+            assert values == {"value1", '"value2"', '"value3"'}
+
+    finally:
+        async with session:
+            await session.execute(sa.text("DELETE FROM variable;"))
+            await session.commit()
         await run_sync_in_worker_thread(alembic_upgrade)

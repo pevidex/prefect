@@ -1,21 +1,24 @@
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from prefect.server.database.dependencies import inject_db
+from prefect.server.database.dependencies import db_injector
 from prefect.server.database.interface import PrefectDBInterface
 from prefect.server.schemas import filters, sorting
 from prefect.server.schemas.actions import VariableCreate, VariableUpdate
 
+if TYPE_CHECKING:
+    from prefect.server.database.orm_models import ORMVariable
 
-@inject_db
+
+@db_injector
 async def create_variable(
+    db: PrefectDBInterface,
     session: AsyncSession,
     variable: VariableCreate,
-    db: PrefectDBInterface,
-):
+) -> "ORMVariable":
     """
     Create a variable
 
@@ -26,19 +29,19 @@ async def create_variable(
     Returns:
         db.Variable
     """
-    model = db.Variable(**variable.dict())
+    model = db.Variable(**variable.model_dump())
     session.add(model)
     await session.flush()
 
     return model
 
 
-@inject_db
+@db_injector
 async def read_variable(
+    db: PrefectDBInterface,
     session: AsyncSession,
     variable_id: UUID,
-    db: PrefectDBInterface,
-):
+) -> Optional["ORMVariable"]:
     """
     Reads a variable by id.
     """
@@ -49,12 +52,12 @@ async def read_variable(
     return result.scalar()
 
 
-@inject_db
+@db_injector
 async def read_variable_by_name(
+    db: PrefectDBInterface,
     session: AsyncSession,
     name: str,
-    db: PrefectDBInterface,
-):
+) -> Optional["ORMVariable"]:
     """
     Reads a variable by name.
     """
@@ -65,22 +68,22 @@ async def read_variable_by_name(
     return result.scalar()
 
 
-@inject_db
+@db_injector
 async def read_variables(
-    session: AsyncSession,
     db: PrefectDBInterface,
+    session: AsyncSession,
     variable_filter: Optional[filters.VariableFilter] = None,
     sort: sorting.VariableSort = sorting.VariableSort.NAME_ASC,
     offset: int = None,
     limit: int = None,
-):
+) -> Sequence["ORMVariable"]:
     """
     Read variables, applying filers.
     """
-    query = sa.select(db.Variable).order_by(sort.as_sql_sort(db))
+    query = sa.select(db.Variable).order_by(sort.as_sql_sort())
 
     if variable_filter:
-        query = query.where(variable_filter.as_sql_filter(db))
+        query = query.where(variable_filter.as_sql_filter())
 
     if offset is not None:
         query = query.offset(offset)
@@ -91,10 +94,10 @@ async def read_variables(
     return result.scalars().unique().all()
 
 
-@inject_db
+@db_injector
 async def count_variables(
-    session: AsyncSession,
     db: PrefectDBInterface,
+    session: AsyncSession,
     variable_filter: Optional[filters.VariableFilter] = None,
 ) -> int:
     """
@@ -104,18 +107,18 @@ async def count_variables(
     query = sa.select(sa.func.count()).select_from(db.Variable)
 
     if variable_filter:
-        query = query.where(variable_filter.as_sql_filter(db))
+        query = query.where(variable_filter.as_sql_filter())
 
     result = await session.execute(query)
     return result.scalar()
 
 
-@inject_db
+@db_injector
 async def update_variable(
+    db: PrefectDBInterface,
     session: AsyncSession,
     variable_id: UUID,
     variable: VariableUpdate,
-    db: PrefectDBInterface,
 ) -> bool:
     """
     Updates a variable by id.
@@ -123,19 +126,19 @@ async def update_variable(
     query = (
         sa.update(db.Variable)
         .where(db.Variable.id == variable_id)
-        .values(**variable.dict(shallow=True, exclude_unset=True))
+        .values(**variable.model_dump_for_orm(exclude_unset=True))
     )
 
     result = await session.execute(query)
     return result.rowcount > 0
 
 
-@inject_db
+@db_injector
 async def update_variable_by_name(
+    db: PrefectDBInterface,
     session: AsyncSession,
     name: str,
     variable: VariableUpdate,
-    db: PrefectDBInterface,
 ) -> bool:
     """
     Updates a variable by name.
@@ -143,18 +146,18 @@ async def update_variable_by_name(
     query = (
         sa.update(db.Variable)
         .where(db.Variable.name == name)
-        .values(**variable.dict(shallow=True, exclude_unset=True))
+        .values(**variable.model_dump_for_orm(exclude_unset=True))
     )
 
     result = await session.execute(query)
     return result.rowcount > 0
 
 
-@inject_db
+@db_injector
 async def delete_variable(
+    db: PrefectDBInterface,
     session: AsyncSession,
     variable_id: UUID,
-    db: PrefectDBInterface,
 ) -> bool:
     """
     Delete a variable by id.
@@ -166,11 +169,11 @@ async def delete_variable(
     return result.rowcount > 0
 
 
-@inject_db
+@db_injector
 async def delete_variable_by_name(
+    db: PrefectDBInterface,
     session: AsyncSession,
     name: str,
-    db: PrefectDBInterface,
 ) -> bool:
     """
     Delete a variable by name.

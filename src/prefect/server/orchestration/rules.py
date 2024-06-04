@@ -22,7 +22,7 @@ from types import TracebackType
 from typing import Any, Dict, Iterable, List, Optional, Type, Union
 
 import sqlalchemy as sa
-from pydantic import Field
+from pydantic import ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from prefect.logging import get_logger
@@ -89,13 +89,12 @@ class OrchestrationContext(PrefectBaseModel):
         proposed_state: the proposed state a run is transitioning into
     """
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     session: Optional[Union[sa.orm.Session, AsyncSession]] = ...
     initial_state: Optional[states.State] = ...
     proposed_state: Optional[states.State] = ...
-    validated_state: Optional[states.State]
+    validated_state: Optional[states.State] = Field(default=None)
     rule_signature: List[str] = Field(default_factory=list)
     finalization_signature: List[str] = Field(default_factory=list)
     response_status: SetStateStatus = Field(default=SetStateStatus.ACCEPT)
@@ -134,16 +133,16 @@ class OrchestrationContext(PrefectBaseModel):
             A mutation-safe copy of the `OrchestrationContext`
         """
 
-        safe_copy = self.copy()
+        safe_copy = self.model_copy()
 
         safe_copy.initial_state = (
-            self.initial_state.copy() if self.initial_state else None
+            self.initial_state.model_copy() if self.initial_state else None
         )
         safe_copy.proposed_state = (
-            self.proposed_state.copy() if self.proposed_state else None
+            self.proposed_state.model_copy() if self.proposed_state else None
         )
         safe_copy.validated_state = (
-            self.validated_state.copy() if self.validated_state else None
+            self.validated_state.model_copy() if self.validated_state else None
         )
         safe_copy.parameters = self.parameters.copy()
         return safe_copy
@@ -233,12 +232,21 @@ class FlowOrchestrationContext(OrchestrationContext):
         Returns:
             None
         """
+        # (circular import)
+        from prefect.server.api.server import is_client_retryable_exception
+
         try:
             await self._validate_proposed_state()
             return
         except Exception as exc:
             logger.exception("Encountered error during state validation")
             self.proposed_state = None
+
+            if is_client_retryable_exception(exc):
+                # Do not capture retryable database exceptions, this exception will be
+                # raised as a 503 in the API layer
+                raise
+
             reason = f"Error validating state: {exc!r}"
             self.response_status = SetStateStatus.ABORT
             self.response_details = StateAbortDetails(reason=reason)
@@ -250,12 +258,23 @@ class FlowOrchestrationContext(OrchestrationContext):
     ):
         if self.proposed_state is None:
             validated_orm_state = self.run.state
-            state_data = None
+            # We cannot access `self.run.state.data` directly for unknown reasons
+            state_data = (
+                (
+                    await artifacts.read_artifact(
+                        self.session, self.run.state.result_artifact_id
+                    )
+                ).data
+                if self.run.state.result_artifact_id
+                else None
+            )
         else:
-            state_payload = self.proposed_state.dict(shallow=True)
+            state_payload = self.proposed_state.model_dump_for_orm()
             state_data = state_payload.pop("data", None)
 
-            if state_data is not None:
+            if state_data is not None and not (
+                isinstance(state_data, dict) and state_data.get("type") == "unpersisted"
+            ):
                 state_result_artifact = core.Artifact.from_result(state_data)
                 state_result_artifact.flow_run_id = self.run.id
                 await artifacts.create_artifact(self.session, state_result_artifact)
@@ -367,12 +386,21 @@ class TaskOrchestrationContext(OrchestrationContext):
         Returns:
             None
         """
+        # (circular import)
+        from prefect.server.api.server import is_client_retryable_exception
+
         try:
             await self._validate_proposed_state()
             return
         except Exception as exc:
             logger.exception("Encountered error during state validation")
             self.proposed_state = None
+
+            if is_client_retryable_exception(exc):
+                # Do not capture retryable database exceptions, this exception will be
+                # raised as a 503 in the API layer
+                raise
+
             reason = f"Error validating state: {exc!r}"
             self.response_status = SetStateStatus.ABORT
             self.response_details = StateAbortDetails(reason=reason)
@@ -384,17 +412,29 @@ class TaskOrchestrationContext(OrchestrationContext):
     ):
         if self.proposed_state is None:
             validated_orm_state = self.run.state
-            state_data = None
+            # We cannot access `self.run.state.data` directly for unknown reasons
+            state_data = (
+                (
+                    await artifacts.read_artifact(
+                        self.session, self.run.state.result_artifact_id
+                    )
+                ).data
+                if self.run.state.result_artifact_id
+                else None
+            )
         else:
-            state_payload = self.proposed_state.dict(shallow=True)
+            state_payload = self.proposed_state.model_dump_for_orm()
             state_data = state_payload.pop("data", None)
 
-            if state_data is not None:
+            if state_data is not None and not (
+                isinstance(state_data, dict) and state_data.get("type") == "unpersisted"
+            ):
                 state_result_artifact = core.Artifact.from_result(state_data)
                 state_result_artifact.task_run_id = self.run.id
 
-                flow_run = await self.flow_run()
-                state_result_artifact.flow_run_id = flow_run.id
+                if self.run.flow_run_id is not None:
+                    flow_run = await self.flow_run()
+                    state_result_artifact.flow_run_id = flow_run.id
 
                 await artifacts.create_artifact(self.session, state_result_artifact)
                 state_payload["result_artifact_id"] = state_result_artifact.id
@@ -626,7 +666,7 @@ class BaseOrchestrationRule(contextlib.AbstractAsyncContextManager):
             mutating the run can also cause unintended writes to the database.
 
         Args:
-            initial_state: The initial state of a transtion
+            initial_state: The initial state of a transition
             proposed_state: The proposed state of a transition
             context: A safe copy of the `OrchestrationContext`, with the exception of
                 `context.run`, mutating this context will have no effect on the broader
@@ -646,7 +686,7 @@ class BaseOrchestrationRule(contextlib.AbstractAsyncContextManager):
         Implements a hook that can fire after a state is committed to the database.
 
         Args:
-            initial_state: The initial state of a transtion
+            initial_state: The initial state of a transition
             validated_state: The governed state that has been committed to the database
             context: A safe copy of the `OrchestrationContext`, with the exception of
                 `context.run`, mutating this context will have no effect on the broader
@@ -671,7 +711,7 @@ class BaseOrchestrationRule(contextlib.AbstractAsyncContextManager):
         keeps track of all other rules that might govern a transition.
 
         Args:
-            initial_state: The initial state of a transtion
+            initial_state: The initial state of a transition
             validated_state: The governed state that has been committed to the database
             context: A safe copy of the `OrchestrationContext`, with the exception of
                 `context.run`, mutating this context will have no effect on the broader

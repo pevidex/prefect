@@ -1,6 +1,7 @@
 """
 Fixtures that create a small distributed storage API, including a storage block
 """
+
 import subprocess
 import sys
 from typing import Any, Optional

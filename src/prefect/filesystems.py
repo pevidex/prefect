@@ -1,22 +1,20 @@
 import abc
-import io
-import json
 import urllib.parse
 from pathlib import Path
-from shutil import ignore_patterns
-from tempfile import TemporaryDirectory
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional
 
 import anyio
 import fsspec
-from pydantic import Field, SecretStr, validator
+from pydantic import Field, SecretStr, field_validator
 
+from prefect._internal.schemas.validators import (
+    stringify_path,
+    validate_basepath,
+)
 from prefect.blocks.core import Block
-from prefect.exceptions import InvalidRepositoryURLError
 from prefect.utilities.asyncutils import run_sync_in_worker_thread, sync_compatible
 from prefect.utilities.compat import copytree
 from prefect.utilities.filesystem import filter_files
-from prefect.utilities.processutils import run_process
 
 
 class ReadableFileSystem(Block, abc.ABC):
@@ -79,7 +77,7 @@ class LocalFileSystem(WritableFileSystem, WritableDeploymentStorage):
     """
 
     _block_type_name = "Local File System"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/EVKjxM7fNyi4NGUSkeTEE/95c958c5dd5a56c59ea5033e919c1a63/image1.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/ad39089fa66d273b943394a68f003f7a19aa850e-48x48.png"
     _documentation_url = (
         "https://docs.prefect.io/concepts/filesystems/#local-filesystem"
     )
@@ -88,11 +86,9 @@ class LocalFileSystem(WritableFileSystem, WritableDeploymentStorage):
         default=None, description="Default local path for this block to write to."
     )
 
-    @validator("basepath", pre=True)
+    @field_validator("basepath", mode="before")
     def cast_pathlib(cls, value):
-        if isinstance(value, Path):
-            return str(value)
-        return value
+        return stringify_path(value)
 
     def _resolve_path(self, path: str) -> Path:
         # Only resolve the base path at runtime, default to the current directory
@@ -113,7 +109,7 @@ class LocalFileSystem(WritableFileSystem, WritableDeploymentStorage):
             path = basepath / path
         else:
             path = path.resolve()
-            if not basepath in path.parents and (basepath != path):
+            if basepath not in path.parents and (basepath != path):
                 raise ValueError(
                     f"Provided path {path} is outside of the base path {basepath}."
                 )
@@ -122,7 +118,7 @@ class LocalFileSystem(WritableFileSystem, WritableDeploymentStorage):
 
     @sync_compatible
     async def get_directory(
-        self, from_path: str = None, local_path: str = None
+        self, from_path: Optional[str] = None, local_path: Optional[str] = None
     ) -> None:
         """
         Copies a directory from one place to another on the local filesystem.
@@ -132,7 +128,7 @@ class LocalFileSystem(WritableFileSystem, WritableDeploymentStorage):
         if not from_path:
             from_path = Path(self.basepath).expanduser().resolve()
         else:
-            from_path = Path(from_path).resolve()
+            from_path = self._resolve_path(from_path)
 
         if not local_path:
             local_path = Path(".").resolve()
@@ -144,7 +140,16 @@ class LocalFileSystem(WritableFileSystem, WritableDeploymentStorage):
             # and we avoid shutil.copytree raising an error
             return
 
-        copytree(from_path, local_path, dirs_exist_ok=True)
+        # .prefectignore exists in the original location, not the current location which
+        # is most likely temporary
+        if (from_path / Path(".prefectignore")).exists():
+            ignore_func = await self._get_ignore_func(
+                local_path=from_path, ignore_file=from_path / Path(".prefectignore")
+            )
+        else:
+            ignore_func = None
+
+        copytree(from_path, local_path, dirs_exist_ok=True, ignore=ignore_func)
 
     async def _get_ignore_func(self, local_path: str, ignore_file: str):
         with open(ignore_file, "r") as f:
@@ -244,7 +249,7 @@ class RemoteFileSystem(WritableFileSystem, WritableDeploymentStorage):
     """
 
     _block_type_name = "Remote File System"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/4CxjycqILlT9S9YchI7o1q/ee62e2089dfceb19072245c62f0c69d2/image12.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/e86b41bc0f9c99ba9489abeee83433b43d5c9365-48x48.png"
     _documentation_url = (
         "https://docs.prefect.io/concepts/filesystems/#remote-file-system"
     )
@@ -252,7 +257,7 @@ class RemoteFileSystem(WritableFileSystem, WritableDeploymentStorage):
     basepath: str = Field(
         default=...,
         description="Default path for this block to write to.",
-        example="s3://my-bucket/my-folder/",
+        examples=["s3://my-bucket/my-folder/"],
     )
     settings: Dict[str, Any] = Field(
         default_factory=dict,
@@ -262,25 +267,9 @@ class RemoteFileSystem(WritableFileSystem, WritableDeploymentStorage):
     # Cache for the configured fsspec file system used for access
     _filesystem: fsspec.AbstractFileSystem = None
 
-    @validator("basepath")
+    @field_validator("basepath")
     def check_basepath(cls, value):
-        scheme, netloc, _, _, _ = urllib.parse.urlsplit(value)
-
-        if not scheme:
-            raise ValueError(f"Base path must start with a scheme. Got {value!r}.")
-
-        if not netloc:
-            raise ValueError(
-                f"Base path must include a location after the scheme. Got {value!r}."
-            )
-
-        if scheme == "file":
-            raise ValueError(
-                "Base path scheme cannot be 'file'. Use `LocalFileSystem` instead for"
-                " local file access."
-            )
-
-        return value
+        return validate_basepath(value)
 
     def _resolve_path(self, path: str) -> str:
         base_scheme, base_netloc, base_urlpath, _, _ = urllib.parse.urlsplit(
@@ -309,7 +298,7 @@ class RemoteFileSystem(WritableFileSystem, WritableDeploymentStorage):
         self, from_path: Optional[str] = None, local_path: Optional[str] = None
     ) -> None:
         """
-        Downloads a directory from a given remote path to a local direcotry.
+        Downloads a directory from a given remote path to a local directory.
 
         Defaults to downloading the entire contents of the block's basepath to the current working directory.
         """
@@ -320,6 +309,10 @@ class RemoteFileSystem(WritableFileSystem, WritableDeploymentStorage):
 
         if local_path is None:
             local_path = Path(".").absolute()
+
+        # validate that from_path has a trailing slash for proper fsspec behavior across versions
+        if not from_path.endswith("/"):
+            from_path += "/"
 
         return self.filesystem.get(from_path, local_path, recursive=True)
 
@@ -332,7 +325,7 @@ class RemoteFileSystem(WritableFileSystem, WritableDeploymentStorage):
         overwrite: bool = True,
     ) -> int:
         """
-        Uploads a directory from a given local path to a remote direcotry.
+        Uploads a directory from a given local path to a remote directory.
 
         Defaults to uploading the entire contents of the current working directory to the block's basepath.
         """
@@ -416,332 +409,11 @@ class RemoteFileSystem(WritableFileSystem, WritableDeploymentStorage):
         return self._filesystem
 
 
-class S3(WritableFileSystem, WritableDeploymentStorage):
-    """
-    Store data as a file on AWS S3.
-
-    Example:
-        Load stored S3 config:
-        ```python
-        from prefect.filesystems import S3
-
-        s3_block = S3.load("BLOCK_NAME")
-        ```
-    """
-
-    _block_type_name = "S3"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/1jbV4lceHOjGgunX15lUwT/db88e184d727f721575aeb054a37e277/aws.png?h=250"
-    _documentation_url = "https://docs.prefect.io/concepts/filesystems/#s3"
-
-    bucket_path: str = Field(
-        default=...,
-        description="An S3 bucket path.",
-        example="my-bucket/a-directory-within",
-    )
-    aws_access_key_id: Optional[SecretStr] = Field(
-        default=None,
-        title="AWS Access Key ID",
-        description="Equivalent to the AWS_ACCESS_KEY_ID environment variable.",
-        example="AKIAIOSFODNN7EXAMPLE",
-    )
-    aws_secret_access_key: Optional[SecretStr] = Field(
-        default=None,
-        title="AWS Secret Access Key",
-        description="Equivalent to the AWS_SECRET_ACCESS_KEY environment variable.",
-        example="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-    )
-
-    _remote_file_system: RemoteFileSystem = None
-
-    @property
-    def basepath(self) -> str:
-        return f"s3://{self.bucket_path}"
-
-    @property
-    def filesystem(self) -> RemoteFileSystem:
-        settings = {}
-        if self.aws_access_key_id:
-            settings["key"] = self.aws_access_key_id.get_secret_value()
-        if self.aws_secret_access_key:
-            settings["secret"] = self.aws_secret_access_key.get_secret_value()
-        self._remote_file_system = RemoteFileSystem(
-            basepath=f"s3://{self.bucket_path}", settings=settings
-        )
-        return self._remote_file_system
-
-    @sync_compatible
-    async def get_directory(
-        self, from_path: Optional[str] = None, local_path: Optional[str] = None
-    ) -> bytes:
-        """
-        Downloads a directory from a given remote path to a local directory.
-
-        Defaults to downloading the entire contents of the block's basepath to the current working directory.
-        """
-        return await self.filesystem.get_directory(
-            from_path=from_path, local_path=local_path
-        )
-
-    @sync_compatible
-    async def put_directory(
-        self,
-        local_path: Optional[str] = None,
-        to_path: Optional[str] = None,
-        ignore_file: Optional[str] = None,
-    ) -> int:
-        """
-        Uploads a directory from a given local path to a remote directory.
-
-        Defaults to uploading the entire contents of the current working directory to the block's basepath.
-        """
-        return await self.filesystem.put_directory(
-            local_path=local_path, to_path=to_path, ignore_file=ignore_file
-        )
-
-    @sync_compatible
-    async def read_path(self, path: str) -> bytes:
-        return await self.filesystem.read_path(path)
-
-    @sync_compatible
-    async def write_path(self, path: str, content: bytes) -> str:
-        return await self.filesystem.write_path(path=path, content=content)
-
-
-class GCS(WritableFileSystem, WritableDeploymentStorage):
-    """
-    Store data as a file on Google Cloud Storage.
-
-    Example:
-        Load stored GCS config:
-        ```python
-        from prefect.filesystems import GCS
-
-        gcs_block = GCS.load("BLOCK_NAME")
-        ```
-    """
-
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/4CD4wwbiIKPkZDt4U3TEuW/c112fe85653da054b6d5334ef662bec4/gcp.png?h=250"
-    _documentation_url = "https://docs.prefect.io/concepts/filesystems/#gcs"
-
-    bucket_path: str = Field(
-        default=...,
-        description="A GCS bucket path.",
-        example="my-bucket/a-directory-within",
-    )
-    service_account_info: Optional[SecretStr] = Field(
-        default=None,
-        description="The contents of a service account keyfile as a JSON string.",
-    )
-    project: Optional[str] = Field(
-        default=None,
-        description=(
-            "The project the GCS bucket resides in. If not provided, the project will"
-            " be inferred from the credentials or environment."
-        ),
-    )
-
-    @property
-    def basepath(self) -> str:
-        return f"gcs://{self.bucket_path}"
-
-    @property
-    def filesystem(self) -> RemoteFileSystem:
-        settings = {}
-        if self.service_account_info:
-            try:
-                settings["token"] = json.loads(
-                    self.service_account_info.get_secret_value()
-                )
-            except json.JSONDecodeError:
-                raise ValueError(
-                    "Unable to load provided service_account_info. Please make sure"
-                    " that the provided value is a valid JSON string."
-                )
-        remote_file_system = RemoteFileSystem(
-            basepath=f"gcs://{self.bucket_path}", settings=settings
-        )
-        return remote_file_system
-
-    @sync_compatible
-    async def get_directory(
-        self, from_path: Optional[str] = None, local_path: Optional[str] = None
-    ) -> bytes:
-        """
-        Downloads a directory from a given remote path to a local directory.
-
-        Defaults to downloading the entire contents of the block's basepath to the current working directory.
-        """
-        return await self.filesystem.get_directory(
-            from_path=from_path, local_path=local_path
-        )
-
-    @sync_compatible
-    async def put_directory(
-        self,
-        local_path: Optional[str] = None,
-        to_path: Optional[str] = None,
-        ignore_file: Optional[str] = None,
-    ) -> int:
-        """
-        Uploads a directory from a given local path to a remote directory.
-
-        Defaults to uploading the entire contents of the current working directory to the block's basepath.
-        """
-        return await self.filesystem.put_directory(
-            local_path=local_path, to_path=to_path, ignore_file=ignore_file
-        )
-
-    @sync_compatible
-    async def read_path(self, path: str) -> bytes:
-        return await self.filesystem.read_path(path)
-
-    @sync_compatible
-    async def write_path(self, path: str, content: bytes) -> str:
-        return await self.filesystem.write_path(path=path, content=content)
-
-
-class Azure(WritableFileSystem, WritableDeploymentStorage):
-    """
-    Store data as a file on Azure Datalake and Azure Blob Storage.
-
-    Example:
-        Load stored Azure config:
-        ```python
-        from prefect.filesystems import Azure
-
-        az_block = Azure.load("BLOCK_NAME")
-        ```
-    """
-
-    _block_type_name = "Azure"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/6AiQ6HRIft8TspZH7AfyZg/39fd82bdbb186db85560f688746c8cdd/azure.png?h=250"
-    _documentation_url = "https://docs.prefect.io/concepts/filesystems/#azure"
-
-    bucket_path: str = Field(
-        default=...,
-        description="An Azure storage bucket path.",
-        example="my-bucket/a-directory-within",
-    )
-    azure_storage_connection_string: Optional[SecretStr] = Field(
-        default=None,
-        title="Azure storage connection string",
-        description=(
-            "Equivalent to the AZURE_STORAGE_CONNECTION_STRING environment variable."
-        ),
-    )
-    azure_storage_account_name: Optional[SecretStr] = Field(
-        default=None,
-        title="Azure storage account name",
-        description=(
-            "Equivalent to the AZURE_STORAGE_ACCOUNT_NAME environment variable."
-        ),
-    )
-    azure_storage_account_key: Optional[SecretStr] = Field(
-        default=None,
-        title="Azure storage account key",
-        description="Equivalent to the AZURE_STORAGE_ACCOUNT_KEY environment variable.",
-    )
-    azure_storage_tenant_id: Optional[SecretStr] = Field(
-        None,
-        title="Azure storage tenant ID",
-        description="Equivalent to the AZURE_TENANT_ID environment variable.",
-    )
-    azure_storage_client_id: Optional[SecretStr] = Field(
-        None,
-        title="Azure storage client ID",
-        description="Equivalent to the AZURE_CLIENT_ID environment variable.",
-    )
-    azure_storage_client_secret: Optional[SecretStr] = Field(
-        None,
-        title="Azure storage client secret",
-        description="Equivalent to the AZURE_CLIENT_SECRET environment variable.",
-    )
-    azure_storage_anon: bool = Field(
-        default=True,
-        title="Azure storage anonymous connection",
-        description=(
-            "Set the 'anon' flag for ADLFS. This should be False for systems that"
-            " require ADLFS to use DefaultAzureCredentials."
-        ),
-    )
-
-    _remote_file_system: RemoteFileSystem = None
-
-    @property
-    def basepath(self) -> str:
-        return f"az://{self.bucket_path}"
-
-    @property
-    def filesystem(self) -> RemoteFileSystem:
-        settings = {}
-        if self.azure_storage_connection_string:
-            settings["connection_string"] = (
-                self.azure_storage_connection_string.get_secret_value()
-            )
-        if self.azure_storage_account_name:
-            settings["account_name"] = (
-                self.azure_storage_account_name.get_secret_value()
-            )
-        if self.azure_storage_account_key:
-            settings["account_key"] = self.azure_storage_account_key.get_secret_value()
-        if self.azure_storage_tenant_id:
-            settings["tenant_id"] = self.azure_storage_tenant_id.get_secret_value()
-        if self.azure_storage_client_id:
-            settings["client_id"] = self.azure_storage_client_id.get_secret_value()
-        if self.azure_storage_client_secret:
-            settings["client_secret"] = (
-                self.azure_storage_client_secret.get_secret_value()
-            )
-        settings["anon"] = self.azure_storage_anon
-        self._remote_file_system = RemoteFileSystem(
-            basepath=f"az://{self.bucket_path}", settings=settings
-        )
-        return self._remote_file_system
-
-    @sync_compatible
-    async def get_directory(
-        self, from_path: Optional[str] = None, local_path: Optional[str] = None
-    ) -> bytes:
-        """
-        Downloads a directory from a given remote path to a local direcotry.
-
-        Defaults to downloading the entire contents of the block's basepath to the current working directory.
-        """
-        return await self.filesystem.get_directory(
-            from_path=from_path, local_path=local_path
-        )
-
-    @sync_compatible
-    async def put_directory(
-        self,
-        local_path: Optional[str] = None,
-        to_path: Optional[str] = None,
-        ignore_file: Optional[str] = None,
-    ) -> int:
-        """
-        Uploads a directory from a given local path to a remote directory.
-
-        Defaults to uploading the entire contents of the current working directory to the block's basepath.
-        """
-        return await self.filesystem.put_directory(
-            local_path=local_path, to_path=to_path, ignore_file=ignore_file
-        )
-
-    @sync_compatible
-    async def read_path(self, path: str) -> bytes:
-        return await self.filesystem.read_path(path)
-
-    @sync_compatible
-    async def write_path(self, path: str, content: bytes) -> str:
-        return await self.filesystem.write_path(path=path, content=content)
-
-
 class SMB(WritableFileSystem, WritableDeploymentStorage):
     """
     Store data as a file on a SMB share.
 
     Example:
-
         Load stored SMB config:
 
         ```python
@@ -751,13 +423,13 @@ class SMB(WritableFileSystem, WritableDeploymentStorage):
     """
 
     _block_type_name = "SMB"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/6J444m3vW6ukgBOCinSxLk/025f5562d3c165feb7a5df599578a6a8/samba_2010_logo_transparent_151x27.png?h=250"
+    _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/3f624663f7beb97d011d011bffd51ecf6c499efc-195x195.png"
     _documentation_url = "https://docs.prefect.io/concepts/filesystems/#smb"
 
     share_path: str = Field(
         default=...,
         description="SMB target (requires <SHARE>, followed by <PATH>).",
-        example="/SHARE/dir/subdir",
+        examples=["/SHARE/dir/subdir"],
     )
     smb_username: Optional[SecretStr] = Field(
         default=None,
@@ -768,7 +440,7 @@ class SMB(WritableFileSystem, WritableDeploymentStorage):
         default=None, title="SMB Password", description="Password for SMB access."
     )
     smb_host: str = Field(
-        default=..., tile="SMB server/hostname", description="SMB server/hostname."
+        default=..., title="SMB server/hostname", description="SMB server/hostname."
     )
     smb_port: Optional[int] = Field(
         default=None, title="SMB port", description="SMB port (default: 445)."
@@ -834,144 +506,3 @@ class SMB(WritableFileSystem, WritableDeploymentStorage):
     @sync_compatible
     async def write_path(self, path: str, content: bytes) -> str:
         return await self.filesystem.write_path(path=path, content=content)
-
-
-class GitHub(ReadableDeploymentStorage):
-    """
-    Interact with files stored on GitHub repositories.
-    """
-
-    _block_type_name = "GitHub"
-    _logo_url = "https://images.ctfassets.net/gm98wzqotmnx/187oCWsD18m5yooahq1vU0/ace41e99ab6dc40c53e5584365a33821/github.png?h=250"
-    _documentation_url = "https://docs.prefect.io/concepts/filesystems/#github"
-
-    repository: str = Field(
-        default=...,
-        description=(
-            "The URL of a GitHub repository to read from, in either HTTPS or SSH"
-            " format."
-        ),
-    )
-    reference: Optional[str] = Field(
-        default=None,
-        description="An optional reference to pin to; can be a branch name or tag.",
-    )
-    access_token: Optional[SecretStr] = Field(
-        name="Personal Access Token",
-        default=None,
-        description=(
-            "A GitHub Personal Access Token (PAT) with repo scope."
-            " To use a fine-grained PAT, provide '{username}:{PAT}' as the value."
-        ),
-    )
-    include_git_objects: bool = Field(
-        default=True,
-        description=(
-            "Whether to include git objects when copying the repo contents to a"
-            " directory."
-        ),
-    )
-
-    @validator("access_token")
-    def _ensure_credentials_go_with_https(cls, v: str, values: dict) -> str:
-        """Ensure that credentials are not provided with 'SSH' formatted GitHub URLs.
-
-        Note: validates `access_token` specifically so that it only fires when
-        private repositories are used.
-        """
-        if v is not None:
-            if urllib.parse.urlparse(values["repository"]).scheme != "https":
-                raise InvalidRepositoryURLError(
-                    "Crendentials can only be used with GitHub repositories "
-                    "using the 'HTTPS' format. You must either remove the "
-                    "credential if you wish to use the 'SSH' format and are not "
-                    "using a private repository, or you must change the repository "
-                    "URL to the 'HTTPS' format. "
-                )
-
-        return v
-
-    def _create_repo_url(self) -> str:
-        """Format the URL provided to the `git clone` command.
-
-        For private repos: https://<oauth-key>@github.com/<username>/<repo>.git
-        All other repos should be the same as `self.repository`.
-        """
-        url_components = urllib.parse.urlparse(self.repository)
-        if url_components.scheme == "https" and self.access_token is not None:
-            updated_components = url_components._replace(
-                netloc=f"{self.access_token.get_secret_value()}@{url_components.netloc}"
-            )
-            full_url = urllib.parse.urlunparse(updated_components)
-        else:
-            full_url = self.repository
-
-        return full_url
-
-    @staticmethod
-    def _get_paths(
-        dst_dir: Union[str, None], src_dir: str, sub_directory: str
-    ) -> Tuple[str, str]:
-        """Returns the fully formed paths for GitHubRepository contents in the form
-        (content_source, content_destination).
-        """
-        if dst_dir is None:
-            content_destination = Path(".").absolute()
-        else:
-            content_destination = Path(dst_dir)
-
-        content_source = Path(src_dir)
-
-        if sub_directory:
-            content_destination = content_destination.joinpath(sub_directory)
-            content_source = content_source.joinpath(sub_directory)
-
-        return str(content_source), str(content_destination)
-
-    @sync_compatible
-    async def get_directory(
-        self, from_path: Optional[str] = None, local_path: Optional[str] = None
-    ) -> None:
-        """
-        Clones a GitHub project specified in `from_path` to the provided `local_path`;
-        defaults to cloning the repository reference configured on the Block to the
-        present working directory.
-
-        Args:
-            from_path: If provided, interpreted as a subdirectory of the underlying
-                repository that will be copied to the provided local path.
-            local_path: A local path to clone to; defaults to present working directory.
-        """
-        # CONSTRUCT COMMAND
-        cmd = ["git", "clone", self._create_repo_url()]
-        if self.reference:
-            cmd += ["-b", self.reference]
-
-        # Limit git history
-        cmd += ["--depth", "1"]
-
-        # Clone to a temporary directory and move the subdirectory over
-        with TemporaryDirectory(suffix="prefect") as tmp_dir:
-            cmd.append(tmp_dir)
-
-            err_stream = io.StringIO()
-            out_stream = io.StringIO()
-            process = await run_process(cmd, stream_output=(out_stream, err_stream))
-            if process.returncode != 0:
-                err_stream.seek(0)
-                raise OSError(f"Failed to pull from remote:\n {err_stream.read()}")
-
-            content_source, content_destination = self._get_paths(
-                dst_dir=local_path, src_dir=tmp_dir, sub_directory=from_path
-            )
-
-            ignore_func = None
-            if not self.include_git_objects:
-                ignore_func = ignore_patterns(".git")
-
-            copytree(
-                src=content_source,
-                dst=content_destination,
-                dirs_exist_ok=True,
-                ignore=ignore_func,
-            )

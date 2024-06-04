@@ -1,13 +1,16 @@
 # Originally generated from `alembic init`
 # https://alembic.sqlalchemy.org/en/latest/tutorial.html#creating-an-environment
 
+import contextlib
+
 import sqlalchemy
 from alembic import context
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from prefect.server.database.configurations import SQLITE_BEGIN_MODE
 from prefect.server.database.dependencies import provide_database_interface
 from prefect.server.utilities.database import get_dialect
-from prefect.utilities.asyncutils import sync_compatible
+from prefect.utilities.asyncutils import run_async_from_worker_thread
 
 db_interface = provide_database_interface()
 config = context.config
@@ -125,11 +128,35 @@ def do_run_migrations(connection: AsyncEngine) -> None:
         template_args={"dialect": dialect.name},
     )
 
-    with context.begin_transaction():
-        context.run_migrations()
+    # We override SQLAlchemy's handling of BEGIN on SQLite and Alembic bypasses our
+    # typical transaction context manager so we set the mode manually here
+    token = SQLITE_BEGIN_MODE.set("IMMEDIATE")
+    try:
+        with disable_sqlite_foreign_keys(context):
+            with context.begin_transaction():
+                context.run_migrations()
+    finally:
+        SQLITE_BEGIN_MODE.reset(token)
 
 
-@sync_compatible
+@contextlib.contextmanager
+def disable_sqlite_foreign_keys(context):
+    """
+    Disable foreign key constraints on sqlite.
+    """
+    if dialect.name == "sqlite":
+        context.execute("COMMIT")
+        context.execute("PRAGMA foreign_keys=OFF")
+        context.execute("BEGIN IMMEDIATE")
+
+    yield
+
+    if dialect.name == "sqlite":
+        context.execute("END")
+        context.execute("PRAGMA foreign_keys=ON")
+        context.execute("BEGIN IMMEDIATE")
+
+
 async def apply_migrations() -> None:
     """
     Apply migrations to the database.
@@ -144,4 +171,9 @@ async def apply_migrations() -> None:
 if context.is_offline_mode():
     dry_run_migrations()
 else:
-    apply_migrations()
+    # Running `apply_migrations` via `asyncio.run` causes flakes in the tests
+    # like: `cache lookup failed for type 338396`. Using `run_async_from_worker_thread`
+    # does not cause this issue, but it is not clear why. The current working theory is
+    # that running `apply_migrations` in another thread gives the migrations enough
+    # isolation to avoid caching issues.
+    run_async_from_worker_thread(apply_migrations)

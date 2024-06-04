@@ -4,14 +4,14 @@
       <PageHeadingFlowRunCreate :deployment="deployment" />
     </template>
 
-    <FlowRunCreateForm :deployment="deployment" :parameters="mappedParameters" @submit="createFlowRun" @cancel="goBack" />
+    <FlowRunCreateFormV2 :deployment="deployment" :parameters="parameters" @submit="createFlowRun" @cancel="goBack" />
   </p-layout-default>
 </template>
 
 <script lang="ts" setup>
   import { showToast } from '@prefecthq/prefect-design'
-  import { FlowRunCreateForm, PageHeadingFlowRunCreate, DeploymentFlowRunCreate, ToastFlowRunCreate, useWorkspaceApi, mapper } from '@prefecthq/prefect-ui-library'
-  import { useSubscription, useRouteParam, useRouteQueryParam } from '@prefecthq/vue-compositions'
+  import { PageHeadingFlowRunCreate, ToastFlowRunCreate, useWorkspaceApi, useDeployment, FlowRunCreateFormV2, DeploymentFlowRunCreateV2, getApiErrorMessage } from '@prefecthq/prefect-ui-library'
+  import { useRouteParam, useRouteQueryParam } from '@prefecthq/vue-compositions'
   import { computed, h } from 'vue'
   import { useRouter } from 'vue-router'
   import { usePageTitle } from '@/compositions/usePageTitle'
@@ -22,28 +22,19 @@
   const deploymentId = useRouteParam('deploymentId')
   const router = useRouter()
   const parameters = useRouteQueryParam('parameters', JSONRouteParam, undefined)
+  const { deployment } = useDeployment(deploymentId)
 
-  const mappedParameters = computed(() => {
-    if (!deployment.value || !parameters.value) {
-      return {}
-    }
-
-    return mapper.map('SchemaValuesResponse', { schema: deployment.value.parameterOpenApiSchema, values: parameters.value }, 'SchemaValues')
-  })
-
-  const deploymentSubscription = useSubscription(api.deployments.getDeployment, [deploymentId])
-  const deployment = computed(() => deploymentSubscription.response)
-
-  const createFlowRun = async (deploymentFlowRun: DeploymentFlowRunCreate): Promise<void> => {
+  const createFlowRun = async (request: DeploymentFlowRunCreateV2): Promise<void> => {
     try {
-      const flowRun = await api.deployments.createDeploymentFlowRun(deploymentId.value, deploymentFlowRun)
-      const startTime = deploymentFlowRun.state?.stateDetails?.scheduledTime ?? undefined
+      const flowRun = await api.deployments.createDeploymentFlowRunV2(deploymentId.value, request)
+      const startTime = request.state?.stateDetails?.scheduledTime ?? undefined
       const immediate = !startTime
       const toastMessage = h(ToastFlowRunCreate, { flowRun, flowRunRoute: routes.flowRun, router, immediate, startTime })
       showToast(toastMessage, 'success')
       router.push(routes.deployment(deploymentId.value))
     } catch (error) {
-      showToast('Something went wrong trying to create a flow run', 'error')
+      const message = getApiErrorMessage(error, 'Something went wrong trying to create a flow run')
+      showToast(message, 'error')
       console.error(error)
     }
   }

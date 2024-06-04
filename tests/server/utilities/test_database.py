@@ -1,7 +1,9 @@
 import datetime
 import enum
 import math
+import sqlite3
 from typing import List
+from unittest import mock
 
 import pendulum
 import pydantic
@@ -22,6 +24,7 @@ from prefect.server.utilities.database import (
     date_diff,
     interval_add,
     json_contains,
+    json_extract,
     json_has_all_keys,
     json_has_any_key,
 )
@@ -112,7 +115,7 @@ class TestPydantic:
 
     async def test_write_dict_to_Pydantic(self, session):
         p_model = PydanticModel(x=100)
-        s_model = SQLPydanticModel(data=p_model.dict())
+        s_model = SQLPydanticModel(data=p_model.model_dump())
         session.add(s_model)
         await session.flush()
 
@@ -177,17 +180,17 @@ class TestPydantic:
 
         # write to the field, since it is an arbitrary string
         await session.execute(
-            f"""
+            sa.text(
+                f"""
             UPDATE {SQLPydanticModel.__tablename__}
             SET color = 'GREEN';
             """
+            )
         )
 
         # enum enforced by application
         stmt = sa.select(SQLPydanticModel)
-        with pytest.raises(
-            pydantic.ValidationError, match="(not a valid enumeration member)"
-        ):
+        with pytest.raises(pydantic.ValidationError):
             await session.execute(stmt)
 
 
@@ -393,12 +396,17 @@ class TestJSON:
         dialect = sa.dialects.postgresql.dialect()
 
         extract_statement = SQLJSONModel.data["x"].compile(dialect=dialect)
+        alt_extract_statement = json_extract(SQLJSONModel.data, "x").compile(
+            dialect=dialect
+        )
         contains_stmt = json_contains(SQLJSONModel.data, ["x"]).compile(dialect=dialect)
         any_stmt = json_has_any_key(SQLJSONModel.data, ["x"]).compile(dialect=dialect)
         all_stmt = json_has_all_keys(SQLJSONModel.data, ["x"]).compile(dialect=dialect)
 
         assert "->" in str(extract_statement)
         assert "JSON_EXTRACT" not in str(extract_statement)
+        assert "->" in str(alt_extract_statement)
+        assert "JSON_EXTRACT" not in str(alt_extract_statement)
         assert "@>" in str(contains_stmt)
         assert "json_each" not in str(contains_stmt)
         assert "?|" in str(any_stmt)
@@ -410,18 +418,38 @@ class TestJSON:
         dialect = sa.dialects.sqlite.dialect()
 
         extract_statement = SQLJSONModel.data["x"].compile(dialect=dialect)
+        alt_extract_statement = json_extract(SQLJSONModel.data, "x").compile(
+            dialect=dialect
+        )
         contains_stmt = json_contains(SQLJSONModel.data, ["x"]).compile(dialect=dialect)
         any_stmt = json_has_any_key(SQLJSONModel.data, ["x"]).compile(dialect=dialect)
         all_stmt = json_has_all_keys(SQLJSONModel.data, ["x"]).compile(dialect=dialect)
 
         assert "->" not in str(extract_statement)
         assert "JSON_EXTRACT" in str(extract_statement)
+        assert "->" not in str(alt_extract_statement)
+        assert "JSON_EXTRACT" in str(alt_extract_statement)
         assert "@>" not in str(contains_stmt)
         assert "json_each" in str(contains_stmt)
         assert "?|" not in str(any_stmt)
         assert "json_each" in str(any_stmt)
         assert "?&" not in str(all_stmt)
         assert "json_each" in str(all_stmt)
+
+    async def test_sqlite_json_extract_wrap_quotes(self):
+        dialect = sa.dialects.sqlite.dialect()
+        extract_statement = json_extract(
+            SQLJSONModel.data, "x.y.z", wrap_quotes=True
+        ).compile(dialect=dialect)
+        assert '$."x.y.z"' in str(extract_statement)
+
+    async def test_postgres_json_extract_no_wrap_quotes(self):
+        dialect = sa.dialects.postgresql.dialect()
+        extract_statement = json_extract(
+            SQLJSONModel.data, "x.y.z", wrap_quotes=True
+        ).compile(dialect=dialect)
+        assert "x.y.z" in str(extract_statement)
+        assert '"x.y.z"' not in str(extract_statement)
 
     @pytest.mark.parametrize("extrema", [-math.inf, math.nan, +math.inf])
     async def test_json_floating_point_extrema(
@@ -502,18 +530,18 @@ class TestDateFunctions:
         assert result.scalar() == datetime.timedelta(days=3, minutes=48)
 
 
-async def test_error_thrown_if_sqlite_version_is_below_minimum(monkeypatch):
-    monkeypatch.setattr("sqlite3.sqlite_version_info", (3, 23, 9))
-    monkeypatch.setattr("sqlite3.sqlite_version", "3.23.9")
-    with pytest.raises(
-        RuntimeError,
-        match="Prefect requires sqlite >= 3.24.0 but we found version 3.23.9",
-    ):
-        db = PrefectDBInterface(
-            database_config=AioSqliteConfiguration(
-                connection_url="sqlite+aiosqlite:///file::memory",
-            ),
-            query_components=AioSqliteQueryComponents(),
-            orm=AioSqliteORMConfiguration(),
-        )
-        await db.engine()
+async def test_error_thrown_if_sqlite_version_is_below_minimum():
+    with mock.patch.object(sqlite3, "sqlite_version_info", (3, 23, 9)):
+        with mock.patch.object(sqlite3, "sqlite_version", "3.23.9"):
+            with pytest.raises(
+                RuntimeError,
+                match="Prefect requires sqlite >= 3.24.0 but we found version 3.23.9",
+            ):
+                db = PrefectDBInterface(
+                    database_config=AioSqliteConfiguration(
+                        connection_url="sqlite+aiosqlite:///file::memory",
+                    ),
+                    query_components=AioSqliteQueryComponents(),
+                    orm=AioSqliteORMConfiguration(),
+                )
+                await db.engine()

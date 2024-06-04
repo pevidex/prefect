@@ -1,6 +1,7 @@
 """
 Routes for interacting with artifact objects.
 """
+
 from typing import List
 from uuid import UUID
 
@@ -23,10 +24,10 @@ router = PrefectRouter(
 @router.post("/")
 async def create_artifact(
     artifact: actions.ArtifactCreate,
-    response: Response = None,
+    response: Response,
     db: PrefectDBInterface = Depends(provide_database_interface),
 ) -> core.Artifact:
-    artifact = core.Artifact(**artifact.dict())
+    artifact = core.Artifact(**artifact.model_dump())
 
     now = pendulum.now("UTC")
 

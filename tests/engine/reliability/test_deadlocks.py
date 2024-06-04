@@ -1,6 +1,4 @@
 import pytest
-
-from prefect import flow
 from tests.generic_tasks import (
     add_one,
     async_multiply_by_two,
@@ -8,6 +6,8 @@ from tests.generic_tasks import (
     sleep,
     subtract_ten,
 )
+
+from prefect import flow
 
 
 @pytest.mark.skip(reason="This test takes multiple minutes")
@@ -45,7 +45,7 @@ def test_sleep_wait_for():
 async def test_async_task_as_dependency():
     @flow
     async def run():
-        multiplied = await async_multiply_by_two.submit(42)
+        multiplied = await async_multiply_by_two(42)
         add_one(multiplied)
 
     await run()

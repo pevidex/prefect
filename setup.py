@@ -1,8 +1,11 @@
+import versioneer
 from setuptools import find_packages, setup
 
-import versioneer
-
-install_requires = open("requirements.txt").read().strip().split("\n")
+client_requires = open("requirements-client.txt").read().strip().split("\n")
+# strip the first line since setup.py will not recognize '-r requirements-client.txt'
+install_requires = (
+    open("requirements.txt").read().strip().split("\n")[1:] + client_requires
+)
 dev_requires = open("requirements-dev.txt").read().strip().split("\n")
 
 setup(
@@ -35,20 +38,43 @@ setup(
         ],
     },
     # Requirements
-    python_requires=">=3.7",
+    python_requires=">=3.9",
     install_requires=install_requires,
-    extras_require={"dev": dev_requires},
+    extras_require={
+        "dev": dev_requires,
+        # Infrastructure extras
+        "aws": "prefect-aws",
+        "azure": "prefect-azure",
+        "gcp": "prefect-gcp",
+        "docker": "prefect-docker",
+        "kubernetes": "prefect-kubernetes",
+        "shell": "prefect-shell",
+        # Distributed task execution extras
+        "dask": "prefect-dask",
+        "ray": "prefect-ray",
+        # Version control extras
+        "bitbucket": "prefect-bitbucket",
+        "github": "prefect-github",
+        "gitlab": "prefect-gitlab",
+        # Database extras
+        "databricks": "prefect-databricks",
+        "dbt": "prefect-dbt",
+        "snowflake": "prefect-snowflake",
+        "sqlalchemy": "prefect-sqlalchemy",
+        # Monitoring extras
+        "email": "prefect-email",
+        "slack": "prefect-slack",
+    },
     classifiers=[
         "Natural Language :: English",
         "Intended Audience :: Developers",
         "Intended Audience :: System Administrators",
         "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3 :: Only",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "Topic :: Software Development :: Libraries",
     ],
 )

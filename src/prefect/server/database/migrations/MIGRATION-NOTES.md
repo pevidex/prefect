@@ -8,6 +8,58 @@ Each time a database migration is written, an entry is included here with:
 
 This gives us a history of changes and will create merge conflicts if two migrations are made at once, flagging situations where a branch needs to be updated before merging.
 
+# Add `events` and `event_resources` tables
+SQLite: `824e9edafa60`
+Postgres: `15768c2ec702`
+
+# Add `trigger_id` to the unique index for `automation_bucket`
+SQLite: `2b6c2b548f95`
+Postgres: `954db7517015`
+
+# Create `csrf_token` table
+SQLite: `bacc60edce16`
+Postgres: `7a653837d9ba`
+
+# Add `job_variables` to `flow_runs`
+SQLite: `342220764f0b`
+Postgres: `121699507574`
+
+# Create `deployment_schedule` and add `Deployment.paused`
+SQLite: `265eb1a2da4c`
+Postgres: `8cf4d4933848`
+
+# Add `sender` to `FlowRunInput`
+SQLite: `c63a0a6dc787`
+Postgres: `6b63c51c31b4`
+
+# Make `FlowRunInput.flow_run_id` a foreign key to `flow_run.id`
+SQLite: `a299308852a7`
+Postgres: `7c453555d3a5`
+
+# Add `flow_run_input` table
+SQLite: `a299308852a7`
+Postgres: `733ca1903976`
+
+# Add last_polled to deployment table
+SQLite: `f3165ae0a213`
+Postgres: `bfe653bbf62e`
+
+# Make flow_run_id nullable on task_run and log tables
+SQLite: `05ea6f882b1d`
+Postgres: `05ea6f882b1d`
+
+# Make slot_decay_per_second not nullable
+SQLite: `8167af8df781`
+Postgres: `4e9a6f93eb6c`
+
+# Add heartbeat_interval_seconds to worker table
+SQLite: `c2d001b7dd06`
+Postgres: `50f8c182c3ca`
+
+# Create Concurrency Limit V2 table
+SQLite: `5b0bd3b41a23`
+Postgres: `5f623ddbf7fe`
+
 # Migrate Artifact data to Artifact Collection
 SQLite: `2dbcec43c857`
 Postgres: `15f5083c16bd`
@@ -264,7 +316,7 @@ Adds tables for storing block data.
 SQLite: `619bea85701a`
 Postgres: `5f376def75c3`
 
-## Intial
+## Initial
 
 Creates the database that previously was not managed by migrations.
 

@@ -3,7 +3,7 @@
   "javascript.format.enable": false,
   "eslint.alwaysShowStatus": true,
   "editor.codeActionsOnSave": {
-    "source.fixAll.eslint": true
+    "source.fixAll.eslint": "explicit"
   },
   "eslint.options": {
     "extensions": [
@@ -18,6 +18,7 @@
   "editor.insertSpaces": true,
   "editor.tabSize": 2,
   "cSpell.words": [
+    "automations",
     "camelcase",
     "Combobox",
     "kubernetes",
@@ -25,7 +26,9 @@
     "rrule",
     "semibold",
     "subflow",
+    "subflows",
     "tailwindcss",
+    "Unconfigured",
     "vite",
     "vitejs"
   ],
@@ -36,7 +39,6 @@
   "files.exclude": {
     "node_modules": true,
     "dist": true,
-    "playwright-report": true,
     "test-results": true,
   },
   "css.customData": [

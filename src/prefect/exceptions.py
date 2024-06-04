@@ -1,13 +1,14 @@
 """
 Prefect-specific exceptions.
 """
+
 import inspect
 import traceback
 from types import ModuleType, TracebackType
 from typing import Callable, Dict, Iterable, List, Optional, Type
 
-import pydantic
 from httpx._exceptions import HTTPStatusError
+from pydantic import ValidationError
 from rich.traceback import Traceback
 from typing_extensions import Self
 
@@ -90,6 +91,18 @@ class PausedRun(PrefectException):
     Raised when the result from a paused run is retrieved.
     """
 
+    def __init__(self, *args, state=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.state = state
+
+
+class UnfinishedRun(PrefectException):
+    """
+    Raised when the result from a run that is not finished is retrieved.
+
+    For example, if a run is in a SCHEDULED, PENDING, CANCELLING, or RUNNING state.
+    """
+
 
 class MissingFlowError(PrefectException):
     """
@@ -164,8 +177,8 @@ class ParameterTypeError(PrefectException):
         super().__init__(msg)
 
     @classmethod
-    def from_validation_error(cls, exc: pydantic.ValidationError) -> Self:
-        bad_params = [f'{err["loc"][0]}: {err["msg"]}' for err in exc.errors()]
+    def from_validation_error(cls, exc: ValidationError) -> Self:
+        bad_params = [f'{".".join(err["loc"])}: {err["msg"]}' for err in exc.errors()]
         msg = "Flow run received invalid parameters:\n - " + "\n - ".join(bad_params)
         return cls(msg)
 
@@ -186,7 +199,7 @@ class ParameterBindError(TypeError, PrefectException):
 
         base = f"Error binding parameters for function '{fn.__name__}': {exc}"
         signature = f"Function '{fn.__name__}' has signature '{fn_signature}'"
-        received = f"received args: {call_args} and kwargs: {call_kwargs}"
+        received = f"received args: {call_args} and kwargs: {list(call_kwargs.keys())}"
         msg = f"{base}.\n{signature} but {received}."
         return cls(msg)
 
@@ -278,6 +291,10 @@ class Pause(PrefectSignal):
     Raised when a flow run is PAUSED and needs to exit for resubmission.
     """
 
+    def __init__(self, *args, state=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.state = state
+
 
 class ExternalSignal(BaseException):
     """
@@ -368,7 +385,7 @@ class InfrastructureNotFound(PrefectException):
 
 class InfrastructureNotAvailable(PrefectException):
     """
-    Raised when infrastructure is not accessable from the current machine. For example,
+    Raised when infrastructure is not accessible from the current machine. For example,
     if a process was spawned on another machine it cannot be managed.
     """
 
@@ -379,3 +396,7 @@ class NotPausedError(PrefectException):
 
 class FlowPauseTimeout(PrefectException):
     """Raised when a flow pause times out"""
+
+
+class FlowRunWaitTimeout(PrefectException):
+    """Raised when a flow run takes longer than a given timeout"""

@@ -1,13 +1,13 @@
 """
 Command line interface for working with profiles.
 """
+
 import os
 import textwrap
 from typing import Optional
 
 import httpx
 import typer
-from fastapi import status
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
@@ -16,9 +16,10 @@ import prefect.settings
 from prefect.cli._types import PrefectTyper
 from prefect.cli._utilities import exit_with_error, exit_with_success
 from prefect.cli.cloud import CloudUnauthorizedError, get_cloud_client
-from prefect.cli.root import app
+from prefect.cli.root import app, is_interactive
 from prefect.client.orchestration import ServerType, get_client
 from prefect.context import use_profile
+from prefect.exceptions import ObjectNotFound
 from prefect.utilities.collections import AutoEnum
 
 profile_app = PrefectTyper(
@@ -77,7 +78,7 @@ def create(
             exit_with_error(f"Profile {from_name!r} not found.")
 
         # Create a copy of the profile with a new name and add to the collection
-        profiles.add_profile(profiles[from_name].copy(update={"name": name}))
+        profiles.add_profile(profiles[from_name].model_copy(update={"name": name}))
     else:
         profiles.add_profile(prefect.settings.Profile(name=name, settings={}))
 
@@ -135,7 +136,7 @@ async def use(name: str):
         ),
         ConnectionStatus.INVALID_API: (
             exit_with_error,
-            f"Error connecting to Prefect API URL",
+            "Error connecting to Prefect API URL",
         ),
     }
 
@@ -179,7 +180,11 @@ def delete(name: str):
             f"Profile {name!r} is the active profile. You must switch profiles before"
             " it can be deleted."
         )
-
+    if is_interactive() and not typer.confirm(
+        (f"Are you sure you want to delete profile with name {name!r}?"),
+        default=False,
+    ):
+        exit_with_error("Deletion aborted.")
     profiles.remove_profile(name)
 
     verb = "Removed"
@@ -202,11 +207,11 @@ def rename(name: str, new_name: str):
     if new_name in profiles:
         exit_with_error(f"Profile {new_name!r} already exists.")
 
-    profiles.add_profile(profiles[name].copy(update={"name": new_name}))
+    profiles.add_profile(profiles[name].model_copy(update={"name": new_name}))
     profiles.remove_profile(name)
 
     # If the active profile was renamed switch the active profile to the new name.
-    context_profile = prefect.context.get_settings_context().profile
+    prefect.context.get_settings_context().profile
     if profiles.active_name == name:
         profiles.set_active(new_name)
     if os.environ.get("PREFECT_PROFILE") == name:
@@ -224,7 +229,7 @@ def rename(name: str, new_name: str):
 def inspect(
     name: Optional[str] = typer.Argument(
         None, help="Name of profile to inspect; defaults to active profile."
-    )
+    ),
 ):
     """
     Display settings from a given profile; defaults to active.
@@ -264,46 +269,47 @@ async def check_orion_connection():
         cloud_client = get_cloud_client(
             httpx_settings=httpx_settings, infer_cloud_url=True
         )
-        await cloud_client.api_healthcheck()
+        async with cloud_client:
+            await cloud_client.api_healthcheck()
         return ConnectionStatus.CLOUD_CONNECTED
     except CloudUnauthorizedError:
         # if the Cloud 2.0 API exists and fails to authenticate, notify the user
         return ConnectionStatus.CLOUD_UNAUTHORIZED
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == status.HTTP_404_NOT_FOUND:
-            # if the route does not exist, attmpt to connect as a hosted Prefect instance
-            try:
-                # inform the user if Prefect API endpoints exist, but there are
-                # connection issues
-                client = get_client(httpx_settings=httpx_settings)
+    except ObjectNotFound:
+        # if the route does not exist, attempt to connect as a hosted Prefect
+        # instance
+        try:
+            # inform the user if Prefect API endpoints exist, but there are
+            # connection issues
+            client = get_client(httpx_settings=httpx_settings)
+            async with client:
                 connect_error = await client.api_healthcheck()
-                if connect_error is not None:
-                    return ConnectionStatus.ORION_ERROR
-                elif client.server_type == ServerType.EPHEMERAL:
-                    # if the client is using an ephemeral Prefect app, inform the user
-                    return ConnectionStatus.EPHEMERAL
-                else:
-                    return ConnectionStatus.ORION_CONNECTED
-            except Exception as exc:
+            if connect_error is not None:
                 return ConnectionStatus.ORION_ERROR
-        else:
-            return ConnectionStatus.CLOUD_ERROR
+            elif client.server_type == ServerType.EPHEMERAL:
+                # if the client is using an ephemeral Prefect app, inform the user
+                return ConnectionStatus.EPHEMERAL
+            else:
+                return ConnectionStatus.ORION_CONNECTED
+        except Exception:
+            return ConnectionStatus.ORION_ERROR
+    except httpx.HTTPStatusError:
+        return ConnectionStatus.CLOUD_ERROR
     except TypeError:
         # if no Prefect API URL has been set, httpx will throw a TypeError
         try:
             # try to connect with the client anyway, it will likely use an
             # ephemeral Prefect instance
             client = get_client(httpx_settings=httpx_settings)
-            connect_error = await client.api_healthcheck()
+            async with client:
+                connect_error = await client.api_healthcheck()
             if connect_error is not None:
                 return ConnectionStatus.ORION_ERROR
             elif client.server_type == ServerType.EPHEMERAL:
                 return ConnectionStatus.EPHEMERAL
             else:
                 return ConnectionStatus.ORION_CONNECTED
-        except Exception as exc:
+        except Exception:
             return ConnectionStatus.ORION_ERROR
-    except (httpx.ConnectError, httpx.UnsupportedProtocol) as exc:
+    except (httpx.ConnectError, httpx.UnsupportedProtocol):
         return ConnectionStatus.INVALID_API
-
-    return exit_method, msg

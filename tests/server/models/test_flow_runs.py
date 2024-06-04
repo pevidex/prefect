@@ -17,18 +17,6 @@ class TestCreateFlowRun:
         )
         assert flow_run.flow_id == flow.id
 
-    async def test_create_flow_run_with_infrastructure(
-        self, flow, session, infrastructure_document_id
-    ):
-        flow_run = await models.flow_runs.create_flow_run(
-            session=session,
-            flow_run=schemas.core.FlowRun(
-                flow_id=flow.id,
-                infrastructure_document_id=infrastructure_document_id,
-            ),
-        )
-        assert flow_run.infrastructure_document_id == infrastructure_document_id
-
     async def test_create_flow_run_has_no_default_state(self, flow, session):
         flow_run = await models.flow_runs.create_flow_run(
             session=session,
@@ -110,7 +98,7 @@ class TestCreateFlowRun:
     # the sqlalchemy session will (correctly) recognize that a new object was
     # added to it with the same primary key as an existing object, and emit a
     # warning. Because that is the situation we want to test for, we filter the
-    # warning to avoid unecessary noise.
+    # warning to avoid unnecessary noise.
     @pytest.mark.filterwarnings(
         "ignore: New instance .* conflicts with persistent instance"
     )
@@ -211,6 +199,7 @@ class TestUpdateFlowRun:
         flow,
         session,
     ):
+        job_vars = {"foo": "bar"}
         flow_run = await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(flow_id=flow.id, flow_version="1.0"),
@@ -223,6 +212,7 @@ class TestUpdateFlowRun:
             flow_run_id=flow_run_id,
             flow_run=schemas.actions.FlowRunUpdate(
                 flow_version="The next one",
+                job_variables=job_vars,
             ),
         )
         assert update_result
@@ -232,6 +222,7 @@ class TestUpdateFlowRun:
         )
         assert flow_run_id == updated_flow_run.id == flow_run.id
         assert updated_flow_run.flow_version == "The next one"
+        assert updated_flow_run.job_variables == job_vars
 
     async def test_update_flow_run_does_not_update_if_nothing_set(self, flow, session):
         flow_run = await models.flow_runs.create_flow_run(
@@ -278,6 +269,18 @@ class TestReadFlowRun:
             session=session, flow_run_id=flow_run.id
         )
         assert flow_run == read_flow_run
+
+    async def test_read_flow_run_with_job_variables(self, flow, session):
+        job_vars = {"foo": "bar"}
+        flow_run = await models.flow_runs.create_flow_run(
+            session=session,
+            flow_run=schemas.core.FlowRun(flow_id=flow.id, job_variables=job_vars),
+        )
+
+        read_flow_run = await models.flow_runs.read_flow_run(
+            session=session, flow_run_id=flow_run.id
+        )
+        assert read_flow_run.job_variables == job_vars
 
     async def test_read_flow_run_returns_none_if_does_not_exist(self, session):
         result = await models.flow_runs.read_flow_run(
@@ -374,7 +377,7 @@ class TestReadFlowRuns:
         assert {res.id for res in result} == {flow_run_3.id}
 
     async def test_read_flow_runs_filters_by_name(self, flow, session):
-        flow_run_1 = await models.flow_runs.create_flow_run(
+        await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(flow_id=flow.id, name="my flow run 1"),
         )
@@ -469,7 +472,7 @@ class TestReadFlowRuns:
                 state=schemas.states.Completed(name="My Completed State"),
             ),
         )
-        flow_run_3 = await models.flow_runs.create_flow_run(
+        await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(
                 flow_id=flow.id, state=schemas.states.Failed(name="RIP")
@@ -517,7 +520,7 @@ class TestReadFlowRuns:
             session=session,
             flow_run=schemas.core.FlowRun(flow_id=flow.id, flow_version="beta"),
         )
-        flow_run_3 = await models.flow_runs.create_flow_run(
+        await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(flow_id=flow.id),
         )
@@ -549,7 +552,7 @@ class TestReadFlowRuns:
         assert len(result) == 0
 
     async def test_read_flow_runs_filters_by_start_time(self, flow, session):
-        now = pendulum.now()
+        now = pendulum.now("UTC")
         flow_run_1 = await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(
@@ -648,7 +651,7 @@ class TestReadFlowRuns:
     async def test_read_flow_runs_filters_by_next_scheduled_start_time(
         self, flow, session
     ):
-        now = pendulum.now()
+        now = pendulum.now("UTC")
         flow_run_1 = await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(
@@ -717,7 +720,7 @@ class TestReadFlowRuns:
         assert {res.id for res in result} == {flow_run_3.id}
 
     async def test_read_flow_runs_filters_by_expected_start_time(self, flow, session):
-        now = pendulum.now()
+        now = pendulum.now("UTC")
         flow_run_1 = await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(
@@ -977,7 +980,7 @@ class TestReadFlowRuns:
     async def test_read_flow_runs_filters_by_flow_and_task_run_criteria(
         self, flow, session
     ):
-        flow_run_1 = await models.flow_runs.create_flow_run(
+        await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(flow_id=flow.id),
         )
@@ -1024,7 +1027,7 @@ class TestReadFlowRuns:
             work_pool_id=work_pool.id,
             work_queue=schemas.actions.WorkQueueCreate(name="work-pool-queue"),
         )
-        flow_run_1 = await models.flow_runs.create_flow_run(
+        await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(flow_id=flow.id),
         )
@@ -1051,7 +1054,7 @@ class TestReadFlowRuns:
             work_pool_id=work_pool.id,
             work_queue=schemas.actions.WorkQueueCreate(name="work-pool-queue"),
         )
-        flow_run_1 = await models.flow_runs.create_flow_run(
+        await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(flow_id=flow.id),
         )
@@ -1069,8 +1072,8 @@ class TestReadFlowRuns:
         assert {res.id for res in result} == {flow_run_2.id}
 
     async def test_read_flow_runs_applies_sort(self, flow, session):
-        now = pendulum.now()
-        flow_run_1 = await models.flow_runs.create_flow_run(
+        now = pendulum.now("UTC")
+        await models.flow_runs.create_flow_run(
             session=session,
             flow_run=schemas.core.FlowRun(
                 flow_id=flow.id,
